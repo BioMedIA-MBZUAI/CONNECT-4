@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- training artifacts (not source) ----
+checkpoints/
+checkpoints_*/
+outputs/
+logs/
+*.pt
+*.pth
+*.ckpt
+
+# ---- local data / caches (live outside the repo on the cluster) ----
+_valid_scans_cache.txt
+*.npy
+
+# ---- external dependency (clone separately, see README) ----
+BrainIAC
+
+# ---- large local artifacts ----
+*.pdf
+
+# ---- misc ----
+.DS_Store
+*.swp

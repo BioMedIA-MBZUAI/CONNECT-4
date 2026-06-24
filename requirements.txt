@@ -1,0 +1,36 @@
+# CONNECT-4 (MICCAI 2026) — Python dependencies
+# Core deep learning
+torch>=2.0
+torchvision
+einops
+
+# Graph attention / hypergraph fusion (Figure 1B)
+torch-geometric>=2.4
+
+# Foundation models
+transformers>=4.40           # Clinical ModernBERT (text encoder)
+monai>=1.3                   # BrainIAC / BMMAE backbones
+
+# Neuroimaging IO, registration, preprocessing
+nibabel>=5.0
+nilearn>=0.10
+scikit-image>=0.20
+scipy>=1.10
+
+# Normative model (Potvin mmc2.xlsm)
+openpyxl>=3.1
+
+# Data / config / utils
+numpy>=1.24
+pandas>=2.0
+pyyaml>=6.0
+matplotlib>=3.7              # magma real-vs-synthetic visualisation
+tqdm
+
+# --- external tools (install separately, not pip) ---
+# SynthSeg  : segmentation — RUN EXTERNALLY by you  https://github.com/BBillot/SynthSeg
+# FSL        : mcflirt motion corr (optional)
+# BrainIAC   : place BrainIAC/ + BrainIAC.ckpt at repo root  https://github.com/AIM-KannLab/BrainIAC
+# BrainLM    : place brainlm_mae/ at repo root               https://github.com/vandijklab/BrainLM
+# AnatCL     : ROI features (precomputed)                    https://github.com/EIDOSLAB/AnatCL
+# SLIM-Brain : optional 4D features (release pending)        arXiv:2512.21881

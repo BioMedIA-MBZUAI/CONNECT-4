@@ -1,0 +1,84 @@
+# CONNECT-4 (MICCAI 2026)
+data:
+  root_dir: "/path/to/data"
+  precomputed_dir: "/path/to/data/reconstructed_graphs"
+  dwi_matrix_path: "/path/to/data/dwi_matrix.csv"
+  target_shape: [128, 128, 128]   # (D, H, W) output grid (paper)
+  num_frames: 128                 # T — number of rs-fMRI frames (paper)
+  voxel_size_mm: 3.0              # isotropic voxel size (paper)
+  tr_seconds: 3.0                 # repetition time (paper)
+  out_channels: 1
+  num_rois: 32
+  normalize_intensity: true
+  use_precomputed: true           # image/mask/ROI node features precomputed by the frozen FMs
+
+models:
+  # ---- A) input foundation models (frozen) --------------------------------
+  brainiac_path: "BrainIAC/src/checkpoints/BrainIAC.ckpt"   # ViT image encoder
+  modernbert_name: "Simonlee711/Clinical_ModernBERT"        # text encoder (auto-downloads)
+
+  # ---- B) graph construction + hyperedge fusion ---------------------------
+  graphs:
+    patch_size: [16, 16, 16]      # 8x8x8 = 512 patches over a 128^3 volume
+    k_neighbors: 5                # Chebyshev k-NN for the image graph
+
+  fusion:
+    image_embed_dim: 768          # BrainIAC ViT
+    mask_embed_dim: 768           # mask-patch embedding
+    roi_embed_dim: 619            # AnatCL (512) + radiomics (107)
+    hidden_dim: 512
+    output_dim: 768               # connectivity-aware patch-token dim d
+    num_attention_layers: 3
+    num_hypergraph_layers: 2
+    num_heads: 8
+    dropout: 0.1
+    num_rois: 32
+
+  # ---- C) DiT generation --------------------------------------------------
+  dit:
+    input_size: [128, 128, 128]   # (D, H, W) generation grid (paper)
+    patch_size: [16, 16, 16]      # 8^3 = 512 patches over the 128^3 volume (matches fusion)
+    hidden_size: 512
+    depth: 8
+    num_heads: 8
+    mlp_ratio: 4.0
+    use_gradient_checkpointing: true   # recompute activations in backward (memory)
+
+  # ---- D) temporal UNet decoder (TC-UNet) --------------------------------
+  unet:
+    base_channels: 64
+    num_levels: 4
+    use_temporal_attn: true     # Temporal Attention blocks (Figure 1D)
+    temporal_attn_heads: 4
+    use_checkpoint: true        # gradient checkpointing (4D volumes are large)
+    temporal_chunk: 8           # frames per decoder chunk; bounds peak memory at T=128
+                                #  (chunks run sequentially + recompute, so peak ~ independent of T)
+
+# ---- E) loss components (Figure 1E) ---------------------------------------
+training:
+  batch_size: 1
+  num_workers: 2
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  epochs: 300
+  amp: true
+  grad_accum_steps: 1
+  grad_clip: 1.0               # gradient-norm clipping (training stability)
+  ckpt_dir: "checkpoints"
+  out_dir: "outputs"            # validation visualisations
+  # patient-level split + in-loop evaluation
+  val_frac: 0.15               # fraction of PATIENTS held out for validation
+  seed: 42
+  log_every: 20                # steps between loss prints
+  eval_every: 200              # steps between validation (metrics + magma viz)
+  val_batches: 4               # val samples averaged per evaluation
+  visualize: true              # save real-vs-synthetic magma figures during validation
+  loss:
+    ssim: 1.0          # 3D SSIM
+    voxel: 1.0         # voxel intensity (L1)
+    volume: 0.5        # per-ROI volume
+    region_hist: 0.5   # region histogram matching
+    perceptual: 0.1    # perceptual (4D deep features)
+    fc: 0.5            # functional-connectivity matrix
+    perceptual_use_slimbrain: false   # true -> use SLIM-Brain 4D features for perceptual loss
+    slimbrain_weights: null           # path to SLIM-Brain weights (arXiv:2512.21881)
