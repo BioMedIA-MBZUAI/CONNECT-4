@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="CONNECT-4 synthesizes subject-specific 4D resting-state fMRI from T1-weighted structural MRI using connectivity-guided hyperedge fusion. MICCAI 2026."
+    />
+    <meta name="theme-color" content="#ffffff" />
+    <meta property="og:title" content="CONNECT-4 · MICCAI 2026" />
+    <meta
+      property="og:description"
+      content="Brain Connectivity-Guided Hyperedge Graph Fusion for Structural MRI to 4D Rest Functional MRI Synthesis."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://biomedia-mbzuai.github.io/CONNECT-4/" />
+    <meta
+      property="og:image"
+      content="https://raw.githubusercontent.com/BioMedIA-MBZUAI/CONNECT-4/main/figures/Arch_Fig.jpg"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <title>CONNECT-4 · MICCAI 2026</title>
+    <link rel="canonical" href="https://biomedia-mbzuai.github.io/CONNECT-4/" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700;800&amp;display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="script.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <header class="site-header" data-header>
+      <div class="header-inner">
+        <a class="brand" href="#overview" aria-label="CONNECT-4 home">
+          CONNECT-4
+        </a>
+
+        <button
+          class="menu-button"
+          type="button"
+          aria-expanded="false"
+          aria-controls="site-navigation"
+          data-menu-button
+        >
+          <span class="menu-button-label">Menu</span>
+          <span class="menu-icon" aria-hidden="true">
+            <span></span>
+            <span></span>
+          </span>
+        </button>
+
+        <nav class="site-nav" id="site-navigation" aria-label="Primary" data-navigation>
+          <a class="nav-link is-active" href="#overview">Overview</a>
+          <a class="nav-link" href="#method">Method</a>
+          <a class="nav-link" href="#results">Results</a>
+          <a class="nav-link" href="#code">Code</a>
+        </nav>
+
+        <a
+          class="button button-small button-outline header-github"
+          href="https://github.com/BioMedIA-MBZUAI/CONNECT-4"
+          target="_blank"
+          rel="noreferrer"
+        >
+          <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2.24c-3.21.7-3.89-1.36-3.89-1.36-.52-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.2 1.77 1.2 1.04 1.78 2.71 1.26 3.37.96.1-.75.4-1.26.74-1.55-2.56-.29-5.26-1.28-5.26-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.16 1.18A11 11 0 0 1 12 6.11c.98 0 1.95.13 2.87.39 2.2-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.7 5.39-5.27 5.68.42.36.78 1.06.78 2.14v3.27c0 .31.21.67.79.56A11.5 11.5 0 0 0 12 .7Z"
+            />
+          </svg>
+          View on GitHub
+        </a>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <section class="hero" id="overview" aria-labelledby="hero-title">
+        <div class="hero-grid page-shell">
+          <div class="hero-copy reveal">
+            <h1 id="hero-title">
+              From one structural scan to a full 4D view of brain function.
+            </h1>
+            <p class="hero-summary">
+              CONNECT-4 synthesizes subject-specific resting-state fMRI from
+              T1-weighted structural MRI through connectivity-guided hyperedge fusion.
+            </p>
+
+            <div class="hero-actions" aria-label="Project actions">
+              <a class="button button-primary" href="#method">
+                Explore the method
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M4 10h11M11 6l4 4-4 4" />
+                </svg>
+              </a>
+              <button class="button button-outline" type="button" data-paper-button>
+                Paper <span aria-hidden="true">·</span> Coming soon
+              </button>
+            </div>
+
+            <div class="hero-meta">
+              <img
+                class="miccai-logo"
+                src="assets/miccai-2026-logo.png"
+                alt="MICCAI 2026, 29th International Conference on Medical Image Computing and Computer Assisted Intervention"
+                width="1200"
+                height="668"
+              />
+              <p class="authors">
+                Salma Hassan <span aria-hidden="true">·</span> Mostafa Salem
+                <span aria-hidden="true">·</span> Ayman Elsayed
+                <span aria-hidden="true">·</span> Olivier Oullier
+                <span aria-hidden="true">·</span> Mohammad Yaqub
+              </p>
+            </div>
+          </div>
+
+          <div class="hero-visual reveal" aria-label="CONNECT-4 hyperedge fusion detail">
+            <div class="hero-network" aria-hidden="true">
+              <span class="network-line line-one"></span>
+              <span class="network-line line-two"></span>
+              <span class="network-line line-three"></span>
+              <span class="node node-blue node-one"></span>
+              <span class="node node-yellow node-two"></span>
+              <span class="node node-coral node-three"></span>
+              <span class="node node-lilac node-four"></span>
+              <span class="node node-blue node-five"></span>
+            </div>
+            <div class="hero-figure-crop" role="img" aria-label="Hyperedge fusion panel from the CONNECT-4 architecture figure"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="architecture section" id="method" aria-labelledby="architecture-title">
+        <div class="page-shell">
+          <div class="section-heading reveal">
+            <p class="section-label">Architecture</p>
+            <h2 id="architecture-title">Anatomy becomes dynamics.</h2>
+            <p>
+              A unified hypergraph fuses image patches, anatomical regions,
+              connectivity priors and normative context before a diffusion
+              transformer and temporal UNet generate 128-frame rs-fMRI.
+            </p>
+          </div>
+
+          <ol class="stage-list reveal" aria-label="CONNECT-4 architecture stages">
+            <li>
+              <button class="stage-button is-active" type="button" data-stage="0">
+                <span class="stage-number stage-blue">1</span>
+                <span>Structure</span>
+              </button>
+            </li>
+            <li>
+              <button class="stage-button" type="button" data-stage="0.31">
+                <span class="stage-number stage-yellow">2</span>
+                <span>Hypergraph</span>
+              </button>
+            </li>
+            <li>
+              <button class="stage-button" type="button" data-stage="0.64">
+                <span class="stage-number stage-lilac">3</span>
+                <span>DiT</span>
+              </button>
+            </li>
+            <li>
+              <button class="stage-button" type="button" data-stage="0.82">
+                <span class="stage-number stage-coral">4</span>
+                <span>Temporal UNet</span>
+              </button>
+            </li>
+            <li>
+              <button class="stage-button" type="button" data-stage="1">
+                <span class="stage-number stage-red">5</span>
+                <span>4D fMRI</span>
+              </button>
+            </li>
+          </ol>
+
+          <figure class="architecture-figure reveal">
+            <div class="architecture-toolbar">
+              <figcaption>Figure 1 <span>CONNECT-4 architecture</span></figcaption>
+              <button class="figure-open" type="button" data-open-figure>
+                Open full figure
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M7 4H4v3M13 4h3v3M7 16H4v-3M13 16h3v-3" />
+                </svg>
+              </button>
+            </div>
+            <div class="architecture-scroller" data-architecture-scroller tabindex="0">
+              <img
+                src="assets/connect4-architecture.jpg"
+                alt="CONNECT-4 pipeline: structural MRI and segmentation processing, graph construction and hyperedge fusion, diffusion transformer generation, temporal UNet, four-dimensional fMRI prediction, and biological loss components."
+                width="2048"
+                height="1317"
+              />
+            </div>
+          </figure>
+        </div>
+      </section>
+
+      <section class="method-highlights section" aria-labelledby="highlights-title">
+        <div class="page-shell">
+          <div class="highlights-intro reveal">
+            <div>
+              <p class="section-label">Method highlights</p>
+              <h2 id="highlights-title">Built around biological structure.</h2>
+            </div>
+            <p>
+              CONNECT-4 treats fMRI synthesis as a systems-level prediction
+              problem—not a contrast translation task.
+            </p>
+          </div>
+
+          <ol class="idea-list reveal">
+            <li>
+              <span class="idea-number stage-blue">01</span>
+              <div>
+                <h3>4D synthesis</h3>
+                <p>Generate a complete spatiotemporal BOLD sequence from a single T1-weighted scan.</p>
+              </div>
+            </li>
+            <li>
+              <span class="idea-number stage-yellow">02</span>
+              <div>
+                <h3>Hyperedge fusion</h3>
+                <p>Unify anatomy, ROI masks, connectivity priors and subject-specific normative context.</p>
+              </div>
+            </li>
+            <li>
+              <span class="idea-number stage-lilac">03</span>
+              <div>
+                <h3>Biological objective</h3>
+                <p>Align voxel signals, regional distributions and functional connectivity across scales.</p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="results section" id="results" aria-labelledby="results-title">
+        <div class="page-shell">
+          <div class="results-heading reveal">
+            <p class="section-label">Evidence</p>
+            <h2 id="results-title">One model. Measurable gains.</h2>
+          </div>
+
+          <dl class="metric-list reveal">
+            <div class="metric metric-blue">
+              <dt><strong>57.1%</strong> lower MSE</dt>
+              <dd>Reconstruction error</dd>
+            </div>
+            <div class="metric metric-yellow">
+              <dt><strong>14.6%</strong> higher SSIM</dt>
+              <dd>Structural similarity</dd>
+            </div>
+            <div class="metric metric-coral">
+              <dt><strong>17.8%</strong> higher ROI correlation</dt>
+              <dd>Regional fidelity</dd>
+            </div>
+          </dl>
+          <p class="evidence-note reveal">Reported against paper baselines.</p>
+        </div>
+      </section>
+
+      <section class="code-section section" id="code" aria-labelledby="code-title">
+        <div class="page-shell code-grid">
+          <div class="code-copy reveal">
+            <p class="section-label">Open source</p>
+            <h2 id="code-title">Follow the research.</h2>
+            <p>
+              The implementation maps every major architecture stage to readable,
+              testable code.
+            </p>
+            <div class="code-actions">
+              <a
+                class="button button-primary"
+                href="https://github.com/BioMedIA-MBZUAI/CONNECT-4"
+                target="_blank"
+                rel="noreferrer"
+              >
+                View repository
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M4 10h11M11 6l4 4-4 4" />
+                </svg>
+              </a>
+              <button class="button button-outline" type="button" data-paper-button>
+                Paper <span aria-hidden="true">·</span> Coming soon
+              </button>
+            </div>
+          </div>
+
+          <div class="code-visual reveal" aria-hidden="true">
+            <div class="code-sheet code-sheet-back"></div>
+            <div class="code-sheet code-sheet-middle"></div>
+            <div class="code-sheet code-sheet-front">
+              <svg viewBox="0 0 120 82">
+                <path d="M43 21 23 41l20 20M77 21l20 20-20 20M68 13 52 69" />
+              </svg>
+            </div>
+            <span class="code-node node-yellow"></span>
+            <span class="code-node node-blue"></span>
+            <span class="code-node node-coral"></span>
+            <span class="code-node node-lilac"></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="team section" aria-labelledby="team-title">
+        <div class="page-shell">
+          <p class="section-label reveal">Research team</p>
+          <h2 class="visually-hidden" id="team-title">CONNECT-4 research team</h2>
+          <ul class="team-list reveal">
+            <li>Salma Hassan</li>
+            <li>Mostafa Salem</li>
+            <li>Ayman Elsayed</li>
+            <li>Olivier Oullier</li>
+            <li>Mohammad Yaqub</li>
+          </ul>
+          <div class="institution reveal">
+            <img
+              class="mbzuai-logo"
+              src="assets/mbzuai-logo.png"
+              alt="Mohamed bin Zayed University of Artificial Intelligence"
+              width="1600"
+              height="487"
+            />
+            <p class="affiliation">Abu Dhabi, UAE</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="page-shell footer-inner">
+        <p>CONNECT-4 <span aria-hidden="true">·</span> MICCAI 2026</p>
+        <a
+          class="button button-small button-outline"
+          href="https://github.com/BioMedIA-MBZUAI/CONNECT-4"
+          target="_blank"
+          rel="noreferrer"
+        >
+          <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2.24c-3.21.7-3.89-1.36-3.89-1.36-.52-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.2 1.77 1.2 1.04 1.78 2.71 1.26 3.37.96.1-.75.4-1.26.74-1.55-2.56-.29-5.26-1.28-5.26-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.16 1.18A11 11 0 0 1 12 6.11c.98 0 1.95.13 2.87.39 2.2-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.7 5.39-5.27 5.68.42.36.78 1.06.78 2.14v3.27c0 .31.21.67.79.56A11.5 11.5 0 0 0 12 .7Z"
+            />
+          </svg>
+          Code on GitHub
+        </a>
+      </div>
+    </footer>
+
+    <dialog class="figure-dialog" data-figure-dialog aria-label="CONNECT-4 architecture figure">
+      <button class="dialog-close" type="button" data-close-figure aria-label="Close full figure">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m6 6 12 12M18 6 6 18" />
+        </svg>
+      </button>
+      <img
+        src="assets/connect4-architecture.jpg"
+        alt="Full CONNECT-4 architecture figure"
+        width="2048"
+        height="1317"
+      />
+    </dialog>
+
+    <div class="toast" role="status" aria-live="polite" data-toast>
+      The paper link will be added after release.
+    </div>
+  </body>
+</html>
