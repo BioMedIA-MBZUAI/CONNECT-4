@@ -1,12 +1,13 @@
 """
 Image Graph Construction Module
-Constructs graph from T1w patches with BMMAE embeddings.
+Constructs graph from T1w patches with frozen BrainIAC embeddings.
 Edges weighted by Chebyshev distance, connected to nearest k neighbors.
 """
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
-import numpy as np
+from typing import Tuple
+
+from architecture_contract import geometric_patch_centers_voxel
 
 
 def chebyshev_distance(pos1: torch.Tensor, pos2: torch.Tensor) -> torch.Tensor:
@@ -17,7 +18,7 @@ def chebyshev_distance(pos1: torch.Tensor, pos2: torch.Tensor) -> torch.Tensor:
 class ImageGraphBuilder(nn.Module):
     """
     Builds graph from T1w image patches.
-    - Nodes: patches with BMMAE embeddings
+    - Nodes: patches with BrainIAC embeddings
     - Edges: weighted by Chebyshev distance, k nearest neighbors
     """
     
@@ -28,28 +29,27 @@ class ImageGraphBuilder(nn.Module):
         edge_weight_threshold: float = 0.0,
     ):
         super().__init__()
-        self.patch_size = patch_size
-        self.k_neighbors = k_neighbors
-        self.edge_weight_threshold = edge_weight_threshold
+        if (
+            len(patch_size) != 3
+            or any(isinstance(value, bool) or int(value) < 1 for value in patch_size)
+        ):
+            raise ValueError("patch_size must contain three positive integers")
+        if isinstance(k_neighbors, bool) or not isinstance(k_neighbors, int) or k_neighbors < 1:
+            raise ValueError("k_neighbors must be a positive integer")
+        if not torch.isfinite(torch.tensor(float(edge_weight_threshold))):
+            raise ValueError("edge_weight_threshold must be finite")
+        self.patch_size = tuple(int(value) for value in patch_size)
+        self.k_neighbors = int(k_neighbors)
+        self.edge_weight_threshold = float(edge_weight_threshold)
     
     def get_patch_positions(
         self,
         spatial_shape: Tuple[int, int, int]
     ) -> torch.Tensor:
-        """Get 3D positions of each patch center."""
-        d_patches = spatial_shape[0] // self.patch_size[0]
-        h_patches = spatial_shape[1] // self.patch_size[1]
-        w_patches = spatial_shape[2] // self.patch_size[2]
-        
-        positions = []
-        for d in range(d_patches):
-            for h in range(h_patches):
-                for w in range(w_patches):
-                    center_d = d * self.patch_size[0] + self.patch_size[0] // 2
-                    center_h = h * self.patch_size[1] + self.patch_size[1] // 2
-                    center_w = w * self.patch_size[2] + self.patch_size[2] // 2
-                    positions.append([center_d, center_h, center_w])
-        
+        """Get canonical geometric XYZ patch centres in C-order."""
+        if len(spatial_shape) != 3:
+            raise ValueError("spatial_shape must be an XYZ triplet")
+        positions = geometric_patch_centers_voxel(spatial_shape, self.patch_size)
         return torch.tensor(positions, dtype=torch.float32)
     
     def build_adjacency(
@@ -61,36 +61,28 @@ class ImageGraphBuilder(nn.Module):
         Build adjacency matrix with Chebyshev distance weights.
         Returns: [num_patches, num_patches] adjacency matrix
         """
-        num_patches = patch_positions.shape[0]
-        adj = torch.zeros(num_patches, num_patches, device=device)
-        
-        # Compute pairwise Chebyshev distances
-        for i in range(num_patches):
-            distances = []
-            for j in range(num_patches):
-                if i == j:
-                    dist = 0.0
-                else:
-                    dist = chebyshev_distance(
-                        patch_positions[i:i+1],
-                        patch_positions[j:j+1]
-                    ).item()
-                distances.append(dist)
-            
-            distances = torch.tensor(distances, device=device)
-            # Get k nearest neighbors (excluding self)
-            _, topk_indices = torch.topk(distances, k=min(self.k_neighbors + 1, num_patches), largest=False)
-            topk_indices = topk_indices[topk_indices != i]  # Remove self
-            
-            # Set edge weights (inverse distance, normalized)
-            for idx in topk_indices:
-                dist = distances[idx].item()
-                if dist > self.edge_weight_threshold:
-                    weight = 1.0 / (1.0 + dist)  # Inverse distance weighting
-                    adj[i, idx] = weight
-                    adj[idx, i] = weight  # Symmetric
-        
-        return adj
+        positions = patch_positions.to(device=device)
+        num_patches = positions.shape[0]
+        if num_patches < 2 or self.k_neighbors >= num_patches:
+            raise ValueError(
+                "image graph requires at least two patches and k_neighbors < num_patches"
+            )
+
+        distances = (positions[:, None, :] - positions[None, :, :]).abs().amax(dim=-1)
+        candidates = distances.clone()
+        candidates.fill_diagonal_(torch.inf)
+        k = min(self.k_neighbors, max(0, num_patches - 1))
+        neighbours = torch.topk(candidates, k=k, largest=False).indices
+        directed = torch.zeros(
+            num_patches, num_patches, dtype=torch.bool, device=device
+        )
+        directed.scatter_(1, neighbours, True)
+        undirected = directed | directed.T
+        undirected &= distances > self.edge_weight_threshold
+
+        # The paper defines the edge attribute as the Chebyshev distance itself
+        # (not a similarity obtained by inverting that distance).
+        return torch.where(undirected, distances, torch.zeros_like(distances))
     
     def forward(
         self,
@@ -101,7 +93,7 @@ class ImageGraphBuilder(nn.Module):
         Build image graph.
         
         Args:
-            patch_embeddings: BMMAE embeddings for each patch [B, num_patches, embed_dim]
+            patch_embeddings: BrainIAC embeddings for each patch [B, num_patches, embed_dim]
             spatial_shape: Spatial dimensions of original image (D, H, W)
         
         Returns:
@@ -122,4 +114,3 @@ class ImageGraphBuilder(nn.Module):
             adj = adj.unsqueeze(0).expand(batch_size, -1, -1)
         
         return patch_embeddings, adj
-

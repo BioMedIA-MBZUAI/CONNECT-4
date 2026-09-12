@@ -10,7 +10,7 @@
 #SBATCH --output=logs/test_1gpu.out
 #SBATCH --error=logs/test_1gpu.out
 
-# Single-GPU functional test of the paper-faithful config (128 frames, 128^3).
+# Single-GPU functional test (paper: 128 frames; spatial grid: pinned T1 contract).
 # One process, no DDP. Confirms a clean training step without OOM.
 set -e
 REPO=/path/to/CONNECT-4

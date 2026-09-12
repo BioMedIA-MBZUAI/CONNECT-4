@@ -7,12 +7,15 @@ Pipeline:
     ->  Structural Atrophy  =  (normal_volume - actual_volume) / normal_volume
     ->  natural-language "Atrophy Description x s"  ->  Clinical ModernBERT.
 
-The normative model is the *original* mmc2.xlsm workbook from Potvin et al.,
-conditioned on subject demographics and acquisition metadata exactly as the
-paper describes.  Nothing here is cohort-level: every prediction is per-subject.
+The implementation evaluates the distributed Potvin ``mmc2.xlsm`` workbook
+with its required age, sex, manufacturer, field-strength, and ICV covariates.
+Those workbook mechanics are versioned source evidence beyond the covariates
+spelled out in the CONNECT-4 manuscript.  Nothing here is cohort-level: every
+prediction is per-subject.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional
 from pathlib import Path
 
@@ -23,22 +26,29 @@ from .subcortical_norms import SubcorticalNorms
 # Keys are the integer ROI ids used by the segmentation; values must match the
 # row labels in mmc2.xlsm ("Statistics" sheet, column A).
 ASEG_TO_NORM_LABEL: Dict[int, str] = {
+    4: "Lateral L",
+    5: "Inferior lateral L",
     10: "Thalamus L",
-    49: "Thalamus R",
     11: "Caudate L",
-    50: "Caudate R",
     12: "Putamen L",
-    51: "Putamen R",
     13: "Pallidum L",
-    52: "Pallidum R",
+    14: "3rd",
+    15: "4th",
+    16: "Brainstem",
     17: "Hippocampus L",
-    53: "Hippocampus R",
     18: "Amygdala L",
-    54: "Amygdala R",
     26: "Accumbens L",
+    28: "Ventral DC L",
+    43: "Lateral R",
+    44: "Inferior lateral R",
+    49: "Thalamus R",
+    50: "Caudate R",
+    51: "Putamen R",
+    52: "Pallidum R",
+    53: "Hippocampus R",
+    54: "Amygdala R",
     58: "Accumbens R",
-    4:  "Lateral Ventricle L",
-    43: "Lateral Ventricle R",
+    60: "Ventral DC R",
 }
 
 
@@ -80,7 +90,14 @@ class AtrophyDescriber:
         )
         normal = pred["pred"]
         atrophy = (normal - measured_volume) / normal if normal else 0.0
-        z = (measured_volume - normal) / pred["se"] if pred["se"] else 0.0
+        if self.norms.region_models[norm_label]["log10_model"]:
+            if measured_volume <= 0:
+                raise ValueError(
+                    f"measured_volume must be positive for log10 model {norm_label!r}"
+                )
+            z = (math.log10(measured_volume) - math.log10(normal)) / pred["se"]
+        else:
+            z = (measured_volume - normal) / pred["se"] if pred["se"] else 0.0
         outside = not (pred["lower"] <= measured_volume <= pred["upper"])
         return {
             "normal_volume": normal,

@@ -59,13 +59,20 @@ class ROIGraphBuilder(nn.Module):
             )
         
         adj = dwi_matrix.clone().to(device)
-        # Ensure symmetric and self-loops
-        adj = (adj + adj.T) / 2.0
-        adj.fill_diagonal_(1.0)
+        if adj.shape != (self.num_rois, self.num_rois):
+            raise ValueError(
+                f"DWI matrix must be {self.num_rois}x{self.num_rois}, got {adj.shape}"
+            )
+        if not torch.isfinite(adj).all():
+            raise ValueError("DWI matrix contains NaN or infinity")
+        if (adj < 0).any():
+            raise ValueError("DWI structural-connectivity coefficients must be non-negative")
+        # The manuscript says ROI edges are taken directly from the fixed DWI
+        # matrix. Do not symmetrise, normalise, threshold, or overwrite its
+        # diagonal here. GATConv supplies computational self-loops separately.
         
         # Expand to batch if needed
         if batch_size > 1:
             adj = adj.unsqueeze(0).expand(batch_size, -1, -1)
         
         return roi_embeddings, adj
-

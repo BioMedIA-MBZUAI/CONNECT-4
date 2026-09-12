@@ -1,0 +1,26 @@
+{
+  "distribution": "pyradiomics",
+  "package_version": "3.0.1",
+  "production_ready": false,
+  "record_sha256": "22cd675e4d7f413c0819926c4715feca470861e92d2f1d70971e1747460958fb",
+  "rejected_distributions": [
+    "pyradiomics-cuda"
+  ],
+  "runtime": {
+    "installed_files_manifest_relative_path": "pyradiomics_official_3_0_1.installed-files.json",
+    "installed_files_manifest_sha256": null,
+    "platform": "linux_x86_64",
+    "python_abi": "cp310",
+    "runtime_root_relative_path": "pyradiomics_official_3_0_1_runtime",
+    "site_packages_relative_path": "lib/python3.10/site-packages",
+    "runtime_tree_sha256": null
+  },
+  "schema": "connect4-official-pyradiomics-runtime-lock-v1",
+  "source_distribution": {
+    "filename": "pyradiomics-3.0.1.tar.gz",
+    "sha256": "47c57f441d6cb7973fa3b2ea48d3948df78e3348e1c69e1e2ff19001601fc2f5",
+    "size": 34473030,
+    "url": "https://files.pythonhosted.org/packages/1b/35/c7f7fb7affd302fd8107dcee6b6e7aaf3708b75ad69d5f9a3dfcadb73eaa/pyradiomics-3.0.1.tar.gz"
+  },
+  "upstream_revision": "08bea7067e350303eead533b471aa60697b3b8c3"
+}

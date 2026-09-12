@@ -1,48 +1,139 @@
 # CONNECT-4 (MICCAI 2026)
 data:
+  # Default manuscript profile: exact A4+ADNI counts and certified fMRIPrep
+  # evidence. The separate A4 recovery profile is explicitly non-certified and
+  # cannot be relabelled as this profile.
+  protocol_profile: "paper-a4-adni-fmriprep-v1"
+  preprocessing_evidence_status: "PAPER_CERTIFIED_FMRIPREP"
   root_dir: "/path/to/data"
   precomputed_dir: "/path/to/data/reconstructed_graphs"
   dwi_matrix_path: "/path/to/data/dwi_matrix.csv"
-  target_shape: [128, 128, 128]   # (D, H, W) output grid (paper)
+  # Raw subject covariates + measured volumes for the 23 ROIs with individual
+  # Potvin workbook models. The loader derives and verifies those normative
+  # sentences; pre-authored prose and fabricated values are rejected.
+  normative_csv_path: "/path/to/data/patient_roi_normative_inputs.csv"
+  # Complete scan_id,patient_id,cohort manifest; explicit patient IDs prevent
+  # ambiguous multi-session file names from leaking across partitions.
+  cohort_manifest: "/path/to/data/connect4_scan_cohorts.csv"
+  expected_cohort_scan_counts:
+    A4: 6290
+    ADNI: 700
+  fmri_dir: "/path/to/data/fMRI"
+  scaler_dir: "/path/to/data/reconstructed_graphs/scalers"
+  require_paper_preprocessing: true  # validate certified sidecars + NIfTI grid/time contract
+  # Required T1-only evidence. Figure 1 labels the structural inputs 128^3;
+  # that spatial claim is distinct from the separately stated 128 time frames.
+  common_grid_contract_path: "/path/to/data/connect4_structural_common_grid.json"
+  common_grid_contract_sha256: null
+  common_grid_contract_sha256_env: "CONNECT4_COMMON_GRID_SHA256"
+  # Mutually exclusive with the certified common-grid authority above. A
+  # non-certified recovery config must clear all common-grid fields and bind
+  # this to the authenticated per-scan native-alignment batch manifest.
+  native_alignment_authority_sha256: null
+  native_alignment_authority_sha256_env: ""
+  native_alignment_authority_path: null
+  structural_stage_root: null
+  # Recovery-target admission additionally authenticates the fixed half-cohort
+  # selection, controller completed set, no-replace marker, and reviewed ec46
+  # implementation. Every field stays null/empty in the paper profile.
+  native_selection_manifest_path: null
+  native_selection_manifest_sha256: null
+  native_selection_manifest_sha256_env: ""
+  native_selection_root_review_path: null
+  native_selection_root_review_sha256: null
+  native_selection_root_review_sha256_env: ""
+  native_completed_set_path: null
+  native_completed_set_sha256: null
+  native_completed_set_sha256_env: ""
+  native_completed_set_commit_marker_path: null
+  native_completed_set_commit_marker_sha256: null
+  native_completed_set_commit_marker_sha256_env: ""
+  native_reviewed_source_path: null
+  native_reviewed_source_sha256: null
+  native_reviewed_source_sha256_env: ""
+  native_runtime_attester_sha256: null
+  native_runtime_attester_sha256_env: ""
+  native_verifier_sha256: null
+  native_verifier_sha256_env: ""
+  # Figure 1 explicitly labels the paper-profile T1/segmentation tensors 128^3.
+  # This paper profile has a training release stop until the exact v10 token-latent
+  # D-slab path is measured on the target A100-40GB hardware.
+  # The 64x80x64 padded subject-native grid belongs only to the explicitly
+  # NON_CERTIFIED A4 recovery profile.
+  architecture_shape: [128, 128, 128]
+  allow_synthetic_grid_override: false
   num_frames: 128                 # T — number of rs-fMRI frames (paper)
-  voxel_size_mm: 3.0              # isotropic voxel size (paper)
+  voxel_size_mm: 3.0              # fixed protocol assertion; any other value is rejected
   tr_seconds: 3.0                 # repetition time (paper)
   out_channels: 1
-  num_rois: 32
+  # Unpublished recovery choice: v54b-compatible per-scan nonnegative q99.5
+  # scaling over functional-validity-supported 4D values only. Background and
+  # padding do not enter the quantile. Temporal voxel z-scoring is forbidden
+  # because it destroys the temporal-mean signal used by Figure 2 and the
+  # volume/histogram objectives.
   normalize_intensity: true
-  use_precomputed: true           # image/mask/ROI node features precomputed by the frozen FMs
 
 models:
   # ---- A) input foundation models (frozen) --------------------------------
   brainiac_path: "BrainIAC/src/checkpoints/BrainIAC.ckpt"   # ViT image encoder
-  modernbert_name: "Simonlee711/Clinical_ModernBERT"        # text encoder (auto-downloads)
+  brainiac_checkpoint_sha256: null
+  brainiac_checkpoint_sha256_env: "CONNECT4_BRAINIAC_SHA256"
+  # Hash returned as source_files_fingerprint_sha256 by
+  # models.brainiac_wrapper.brainiac_source_fingerprint.
+  brainiac_source_sha256: null
+  brainiac_source_sha256_env: "CONNECT4_BRAINIAC_SOURCE_SHA256"
+  modernbert_name: "Simonlee711/Clinical_ModernBERT"        # frozen text encoder
+  # Required for a Hub model; alternatively make modernbert_name a local,
+  # immutable directory. Cache validation fingerprints the complete artifact.
+  modernbert_revision: "<full immutable Hugging Face commit SHA>"
 
   # ---- B) graph construction + hyperedge fusion ---------------------------
   graphs:
-    patch_size: [16, 16, 16]      # 8x8x8 = 512 patches over a 128^3 volume
-    k_neighbors: 5                # Chebyshev k-NN for the image graph
+    # Figure 1 depicts aligned 16^3 structural patches. This yields 512 patches
+    # on the paper grid and 80 only on the A4 recovery grid.
+    patch_size: [16, 16, 16]
+    k_neighbors: 5                # implementation default
 
   fusion:
-    image_embed_dim: 768          # BrainIAC ViT
-    mask_embed_dim: 768           # mask-patch embedding
-    roi_embed_dim: 619            # AnatCL (512) + radiomics (107)
+    # Architecture widths are implementation defaults where the paper is silent.
+    image_embed_dim: 768          # BrainIAC ViT output used by this implementation
+    mask_embed_dim: 768           # Clinical-ModernBERT output used by this implementation
+    roi_embed_dim: 619            # AnatCL (512) + PyRadiomics (107)
     hidden_dim: 512
     output_dim: 768               # connectivity-aware patch-token dim d
     num_attention_layers: 3
-    num_hypergraph_layers: 2
     num_heads: 8
     dropout: 0.1
     num_rois: 32
 
   # ---- C) DiT generation --------------------------------------------------
   dit:
-    input_size: [128, 128, 128]   # (D, H, W) generation grid (paper)
-    patch_size: [16, 16, 16]      # 8^3 = 512 patches over the 128^3 volume (matches fusion)
+    # Figure 1 requires a complete-grid 64-channel TC-UNet handoff but does not
+    # publish the token codec. This v10 implementation choice encodes aligned
+    # scalar 4D patches once, performs diffusion wholly in 512-dimensional token
+    # coordinates, decodes x0 tokens once to the complete scalar grid, and then
+    # applies a channel-only 1x1x1 projection. It removes the invalid v9 attempt
+    # to predict 65,536-dimensional raw iid epsilon through a 512-wide token.
+    diffusion_domain: "connect4-token-latent-diffusion-v1"
+    input_size: [128, 128, 128]
+    patch_size: [16, 16, 16]
+    # Figure 1C labels 3D Window Attention while the prose calls spatial
+    # interactions global. This manuscript-underspecified v10 choice uses one
+    # 8x8x8 window covering the complete paper patch grid, plus a separate
+    # global temporal attention path in every DiT block.
+    spatial_window_size: [8, 8, 8]
+    # One frame per token group limits the scalar-patch codec to 4096->512 (8x)
+    # instead of v9's destructive 65536->512 (128x) compression. This increases
+    # DiT token count and must pass the fresh one-/four-A100 v10 gates.
+    temporal_patch_size: 1
     hidden_size: 512
     depth: 8
     num_heads: 8
     mlp_ratio: 4.0
-    use_gradient_checkpointing: true   # recompute activations in backward (memory)
+    num_diffusion_steps: 1000   # forward noising schedule used for epsilon training
+    beta_schedule: "linear"
+    num_inference_steps: 50     # DDIM reverse steps
+    eta: 0.0                    # deterministic DDIM trajectory
 
   # ---- D) temporal UNet decoder (TC-UNet) --------------------------------
   unet:
@@ -51,34 +142,176 @@ models:
     use_temporal_attn: true     # Temporal Attention blocks (Figure 1D)
     temporal_attn_heads: 4
     use_checkpoint: true        # gradient checkpointing (4D volumes are large)
-    temporal_chunk: 8           # frames per decoder chunk; bounds peak memory at T=128
-                                #  (chunks run sequentially + recompute, so peak ~ independent of T)
+    temporal_chunk: 0           # required: attention sees all 128 temporal frames
+    # Exact seam-free D slabs. D is never pooled; the implementation derives a
+    # 14-voxel halo from the instantiated v10 receptive field and fails closed if
+    # a future operator invalidates that derivation. The production core remains
+    # deliberately unresolved until the supplied A100 sweep selects the largest
+    # core that completes a full AdamW step plus target-blind 50-step inference
+    # under a 4-GiB safety margin. A matching exact 4-rank DDP step is separate.
+    depth_slab_size: null
+    depth_slab_sweep_summary_path: null
+    depth_slab_sweep_summary_sha256: null
+    depth_slab_sweep_summary_sha256_env: ""
+    depth_slab_ddp_smoke_path: null
+    depth_slab_ddp_smoke_sha256: null
+    depth_slab_ddp_smoke_sha256_env: ""
+    # T1 high-pass injection is forbidden: it can paint anatomical texture onto
+    # fMRI. Spatial detail must be learned from the diffusion latent and TC-UNet.
+    detail_path_enabled: false
 
 # ---- E) loss components (Figure 1E) ---------------------------------------
 training:
-  batch_size: 1
+  batch_size: 4                # paper; GLOBAL batch (1 sample/rank on 4 GPUs)
   num_workers: 2
+  optimizer: "AdamW"           # paper
   learning_rate: 0.0001
   weight_decay: 0.0001
-  epochs: 300
+  epochs: 200                  # paper: train for up to 200 epochs
   amp: true
   grad_accum_steps: 1
   grad_clip: 1.0               # gradient-norm clipping (training stability)
+  diffusion_weight: 1.0        # epsilon-denoising objective (DDIM training)
+  # Implementation-only v10 codec safeguard: voxel MSE plus mean temporal and
+  # spatial first-difference MSE. It does not alter Figure-1E loss lambdas.
+  token_codec_reconstruction_weight: 1.0
   ckpt_dir: "checkpoints"
   out_dir: "outputs"            # validation visualisations
-  # patient-level split + in-loop evaluation
+  # fixed, patient-disjoint split; test is read only after final training
   val_frac: 0.15               # fraction of PATIENTS held out for validation
+  test_frac: 0.15              # disjoint synthesis test patients
+  # Runtime is read-only: build this authority explicitly offline and pin its
+  # exact file digest. Missing authorities are never generated by train/infer.
+  split_manifest: "splits/connect4_patient_split.json"
+  split_manifest_sha256: null
+  split_manifest_sha256_env: "CONNECT4_SPLIT_MANIFEST_SHA256"
   seed: 42
   log_every: 20                # steps between loss prints
   eval_every: 200              # steps between validation (metrics + magma viz)
+  ckpt_every: 100              # resumable non-selectable progress checkpoints
   val_batches: 4               # val samples averaged per evaluation
   visualize: true              # save real-vs-synthetic magma figures during validation
+  # Implementation-only fail-closed development QA. These thresholds and
+  # equations are engineering release policy, not claims published in the paper.
+  # Routine checks use the fixed authenticated first four visits for turnaround;
+  # only the final all-development pass may make a checkpoint selectable.
+  development_quality_gate:
+    schema: "connect4-development-quality-policy-v2"
+    enabled: true
+    policy_note: "CONNECT-4 implementation QA thresholds; configurable and not paper-reported synthesis metrics"
+    required_checks:
+      - spatial_high_frequency_ratio
+      - spatial_high_frequency_correlation
+      - dynamic_high_frequency_ratio
+      - dynamic_high_frequency_correlation
+      - temporal_variance_ratio
+      - dvars_ratio
+      - dynamic_power_ratio
+      - effective_rank_ratio
+      - near_static_voxel_fraction
+      - structured_temporal_available
+      - roi_fc_correlation
+      - roi_power_spectrum_correlation
+    routine:
+      extent: "fixed-authenticated-first-n"
+      num_samples: 4
+    selection:
+      extent: "all-authenticated-development"
+      num_samples: "all"
+      final_only: true
+    policy:
+      affine_atol_mm: 0.0001
+      tr_atol_seconds: 0.000001
+      support_fraction_of_real_q99: 0.10
+      min_support_dice: 0.85
+      max_support_com_distance_mm: 8.0
+      max_mask_boundary_fraction: 0.01
+      max_outside_mask_leakage_ratio: 0.01
+      min_spatial_robust_range_ratio: 0.70
+      max_spatial_robust_range_ratio: 2.00
+      min_spatial_gradient_ratio: 0.80
+      max_spatial_gradient_ratio: 2.00
+      min_spatial_laplacian_ratio: 0.80
+      max_spatial_laplacian_ratio: 2.00
+      min_spatial_high_frequency_ratio: 0.80
+      max_spatial_high_frequency_ratio: 2.00
+      min_spatial_high_frequency_correlation: 0.40
+      min_dynamic_high_frequency_ratio: 0.70
+      max_dynamic_high_frequency_ratio: 4.00
+      min_dynamic_high_frequency_correlation: 0.40
+      high_frequency_sigma_voxels: 1.0
+      spatial_sample_frames: 8
+      min_temporal_variance_ratio: 0.50
+      max_temporal_variance_ratio: 4.00
+      min_dvars_ratio: 0.70
+      max_dvars_ratio: 4.00
+      min_dynamic_power_ratio: 0.50
+      max_dynamic_power_ratio: 4.00
+      min_effective_rank_ratio: 0.70
+      max_effective_rank_ratio: 2.00
+      near_static_relative_variance: 0.25
+      max_near_static_voxel_fraction: 0.25
+      min_structured_temporal_rois: 4
+      min_roi_fc_correlation: 0.40
+      min_roi_power_spectrum_correlation: 0.40
+      temporal_failures_for_collapse: 3
+      reference_epsilon: 0.000000000001
+      temporal_chunk_voxels: 16384
   loss:
-    ssim: 1.0          # 3D SSIM
-    voxel: 1.0         # voxel intensity (L1)
-    volume: 0.5        # per-ROI volume
-    region_hist: 0.5   # region histogram matching
-    perceptual: 0.1    # perceptual (4D deep features)
-    fc: 0.5            # functional-connectivity matrix
-    perceptual_use_slimbrain: false   # true -> use SLIM-Brain 4D features for perceptual loss
-    slimbrain_weights: null           # path to SLIM-Brain weights (arXiv:2512.21881)
+    voxel: 1.0         # lambda_voxel (paper)
+    ssim: 0.5          # lambda_SSIM (paper)
+    fc: 0.3            # lambda_FC (paper)
+    temporal: 0.2      # lambda_temporal (paper; first-order frame differences)
+    perceptual: 0.1    # lambda_perceptual (paper; BrainLM ref. [5])
+    # Figure 1E auxiliaries; the manuscript does not publish their lambdas.
+    volume: 0.5        # implementation default: per-ROI volume
+    region_hist: 0.5   # implementation default: regional distribution matching
+    perceptual_extractor:
+      enabled: true
+      name: "brainlm"
+      source_root: null
+      source_root_env: "CONNECT4_BRAINLM_SOURCE_ROOT"
+      source_publication_marker: null
+      source_publication_marker_env: "CONNECT4_BRAINLM_PUBLICATION_MARKER"
+      source_publication_marker_sha256: "af79bf37838aeb2f67005deb6750e3ad62eeb8fe65ff5190c0b304b4fdc23912"
+      checkpoint: null
+      checkpoint_env: ""
+      checkpoint_sha256: "e647c70b2af023d945bfd61b4187c4fdf1700fbb4433a0818e982520564493c5"
+      checkpoint_sha256_env: ""
+      config: null
+      config_env: ""
+      config_sha256: "03142b047b43e174a1f2d9f64c43396916740abf014f9a404e33487575714091"
+      config_sha256_env: ""
+      source_revision: "eded39c86c27e03f5ead1d6a14311e92d1305e5e"
+      source_revision_env: ""
+      atlas: null
+      atlas_env: ""
+      coordinates: null
+      coordinates_env: ""
+      authority: null
+      authority_env: "CONNECT4_BRAINLM_MNI_AUTHORITY"
+      authority_sha256: null
+      authority_sha256_env: "CONNECT4_BRAINLM_MNI_AUTHORITY_SHA256"
+      resample_chunk_frames: 4
+      adapter_contract: "connect4-brainlm-a424-contextual-perceptual-v2"
+
+# Final synthesis metrics. FID uses SLIM-Brain embeddings; IS additionally
+# requires a trained classification-logits head in the serialized module.
+evaluation:
+  batch_size: 1
+  num_workers: 1
+  quality_gates:
+    paired_4d_required: true
+    texture_retention_required: true
+    texture_anti_gaming_required: true
+    require_structured_temporal: true
+  feature_extractor:
+    enabled: true
+    name: "slimbrain"
+    checkpoint: null
+    checkpoint_env: "CONNECT4_SLIMBRAIN_CHECKPOINT"
+    checkpoint_sha256: null
+    checkpoint_sha256_env: "CONNECT4_SLIMBRAIN_SHA256"
+    source_revision: null
+    source_revision_env: "CONNECT4_SLIMBRAIN_SOURCE_REVISION"
+    adapter_contract: "connect4-slimbrain-4d-adapter-v1"

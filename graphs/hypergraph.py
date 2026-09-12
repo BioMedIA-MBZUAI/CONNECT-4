@@ -5,11 +5,12 @@ Creates hyperedges connecting:
 - Patch node from mask graph  
 - Corresponding ROI nodes based on structures present in patch (if any)
 Weighted by structure distribution in patch.
-For background-only patches, only connects image and mask patch nodes.
+Background-only patches do not create hyperedges: the paper defines one
+hyperedge only for a non-zero-coverage ROI in a patch.
 """
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 import numpy as np
 
 
@@ -26,6 +27,8 @@ class HypergraphBuilder(nn.Module):
         super().__init__()
         self.num_patches = num_patches
         self.num_rois = num_rois
+        # Parameter-free modules otherwise cannot observe ``module.to(device)``.
+        self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
     
     def build_hyperedges(
         self,
@@ -38,7 +41,7 @@ class HypergraphBuilder(nn.Module):
         
         Returns:
             hyperedge_index: [2, num_hyperedges] - (node_idx, hyperedge_idx)
-            hyperedge_weights: [num_hyperedges] - weights based on distribution
+            hyperedge_weights: [num_hyperedges] - fractional ROI coverages
         """
         hyperedges = []
         hyperedge_weights = []
@@ -48,7 +51,9 @@ class HypergraphBuilder(nn.Module):
         # - Image patch node (patch_idx)
         # - Mask patch node (patch_idx + num_patches)
         # - ROI node for that specific structure
-        # For background-only patches, create one hyperedge with just image and mask nodes
+        # Patches containing no foreground ROI deliberately contribute no
+        # hyperedge. Nodes2Token still emits their tokens by adding the 3D
+        # positional encoding to a zero pooled representation.
         
         for patch_idx in range(self.num_patches):
             dist = patch_distributions[patch_idx]
@@ -61,27 +66,32 @@ class HypergraphBuilder(nn.Module):
                     f"First few entries: {[type(patch_distributions[i]).__name__ if i < len(patch_distributions) else 'N/A' for i in range(min(5, len(patch_distributions) if hasattr(patch_distributions, '__len__') else 0))]}"
                 )
             
-            # Filter out background (label 0) and only keep structures in structure_to_roi_idx
+            # Validate values before filtering so a corrupt background or
+            # unmapped entry cannot be silently hidden by the selection logic.
+            for structure_id, coverage in dist.items():
+                if not np.isfinite(float(coverage)):
+                    raise RuntimeError(
+                        f"NaN/Inf in coverage for patch {patch_idx}, "
+                        f"structure {structure_id}: {coverage}"
+                    )
+                if not 0.0 <= float(coverage) <= 1.0:
+                    raise ValueError(
+                        f"ROI coverage must lie in [0,1], got {coverage} for "
+                        f"patch {patch_idx}, structure {structure_id}"
+                    )
+
+            # The paper creates an edge only for a foreground ROI with strictly
+            # positive (non-zero) fractional coverage.
             valid_dist = {
-                structure_id: coverage 
-                for structure_id, coverage in dist.items() 
-                if structure_id != 0 and structure_id in structure_to_roi_idx
+                structure_id: float(coverage)
+                for structure_id, coverage in dist.items()
+                if structure_id != 0
+                and structure_id in structure_to_roi_idx
+                and float(coverage) > 0.0
             }
-            
-            # Get background coverage
-            background_coverage = dist.get(0, 0.0)
-            
-            # Check for NaN/Inf in background_coverage
-            if not np.isfinite(background_coverage):
-                raise RuntimeError(f"NaN/Inf in background_coverage for patch {patch_idx}: {background_coverage}")
             
             # Create one hyperedge per structure in this patch
             if valid_dist:
-                # Check for NaN/Inf in coverages
-                for sid, cov in valid_dist.items():
-                    if not np.isfinite(cov):
-                        raise RuntimeError(f"NaN/Inf in coverage for patch {patch_idx}, structure {sid}: {cov}")
-                
                 # Create a separate hyperedge for each structure
                 for structure_id, coverage in valid_dist.items():
                     # Create hyperedge connecting image patch, mask patch, and this ROI
@@ -108,31 +118,9 @@ class HypergraphBuilder(nn.Module):
                         'weight': hyperedge_weight,
                     })
                     hyperedge_weights.append(hyperedge_weight)
-            else:
-                # Background-only patch: create one hyperedge with just image and mask nodes
-                hyperedge_nodes = []
-                
-                # Always add image patch node
-                image_node_idx = patch_idx
-                hyperedge_nodes.append(image_node_idx)
-                
-                # Always add mask patch node
-                mask_node_idx = patch_idx + self.num_patches
-                hyperedge_nodes.append(mask_node_idx)
-                
-                # Weight by background coverage or small default
-                hyperedge_weight = float(background_coverage) if background_coverage > 0 else 0.1
-                
-                hyperedges.append({
-                    'nodes': hyperedge_nodes,
-                    'weight': hyperedge_weight,
-                })
-                hyperedge_weights.append(hyperedge_weight)
         
         # Convert to edge index format
-        # We have one hyperedge per structure per patch (plus one for background-only patches)
-        # So we'll have >= num_patches hyperedges (more if patches have multiple structures)
-        num_hyperedges = len(hyperedges)
+        # We have one hyperedge per non-background structure per patch.
         edge_list = []
         
         for hyperedge_idx, hyperedge in enumerate(hyperedges):
@@ -142,19 +130,44 @@ class HypergraphBuilder(nn.Module):
         if edge_list:
             hyperedge_index = torch.tensor(edge_list, dtype=torch.long, device=device).T
         else:
-            # This should not happen since we create at least one hyperedge per patch
-            print(f"WARNING: No hyperedges created despite processing {self.num_patches} patches. "
-                  f"This indicates a bug in the hypergraph construction.")
+            # A scan can validly contain no mapped foreground ROI (for example,
+            # an empty/cropped mask); represent that as an empty incidence map.
             hyperedge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
         
         hyperedge_weights_tensor = torch.tensor(hyperedge_weights, dtype=torch.float32, device=device)
         
-        # Validate: we should have at least num_patches hyperedges (one per patch minimum)
-        if len(hyperedge_weights_tensor) < self.num_patches:
-            print(f"WARNING: Expected at least {self.num_patches} hyperedges (one per patch) but got {len(hyperedge_weights_tensor)}. "
-                  f"This may indicate a data preprocessing issue.")
-        
         return hyperedge_index, hyperedge_weights_tensor
+
+    def patch_ids_from_index(self, hyperedge_index: torch.Tensor) -> torch.Tensor:
+        """Return the source patch id for every real hyperedge.
+
+        Each paper-defined hyperedge contains exactly one image-patch node in
+        ``[0, num_patches)``. Deriving group ids from incidence avoids relying
+        on hyperedge enumeration (a patch may own zero, one, or many edges).
+        """
+        if hyperedge_index.ndim != 2 or hyperedge_index.shape[0] != 2:
+            raise ValueError("hyperedge_index must have shape [2, num_incidents]")
+        if hyperedge_index.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=hyperedge_index.device)
+        num_hyperedges = int(hyperedge_index[1].max().item()) + 1
+        patch_ids = torch.full(
+            (num_hyperedges,), -1, dtype=torch.long, device=hyperedge_index.device
+        )
+        node_ids, edge_ids = hyperedge_index
+        image_incidence = node_ids < self.num_patches
+        image_counts = torch.zeros(
+            num_hyperedges, dtype=torch.long, device=hyperedge_index.device
+        )
+        image_counts.scatter_add_(
+            0, edge_ids[image_incidence], torch.ones_like(edge_ids[image_incidence])
+        )
+        if (image_counts != 1).any():
+            bad = torch.nonzero(image_counts != 1, as_tuple=False).flatten().tolist()
+            raise ValueError(
+                f"Hyperedges must contain exactly one image-patch node: {bad}"
+            )
+        patch_ids[edge_ids[image_incidence]] = node_ids[image_incidence]
+        return patch_ids
     
     def forward(
         self,
@@ -172,11 +185,8 @@ class HypergraphBuilder(nn.Module):
             hyperedge_index: [2, num_hyperedges]
             hyperedge_weights: [num_hyperedges]
         """
-        device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
-        
         return self.build_hyperedges(
             patch_distributions,
             structure_to_roi_idx,
-            device,
+            self._device_anchor.device,
         )
-

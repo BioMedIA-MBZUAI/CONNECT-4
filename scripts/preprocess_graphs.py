@@ -51,7 +51,6 @@ from tqdm import tqdm
 import json
 from typing import Dict, List, Tuple
 import time
-from functools import partial
 
 # Delay torch import - it will be imported in worker_process after CUDA_VISIBLE_DEVICES is set
 # For the main process, we'll import it normally
@@ -88,13 +87,32 @@ try:
     # Now import the specific modules
     from data.dataset import Connect4Dataset
     from data.patchify import Patchify3D
+    from data.protocol import (
+        build_external_cache_protocol_context,
+        conditioning_identity_from_cache_sources,
+        load_completed_synthesis_checkpoint,
+        patient_level_split_from_manifest,
+        validate_external_scaler_provenance,
+        validate_fixed_protocol_config,
+        validate_training_cohort_manifest,
+        validate_training_scaler_provenance,
+    )
+    from data.patch_descriptions import (
+        KNOWN_FUNCTIONAL_CONNECTIVITY,
+        PATCH_DESCRIPTION_SCHEMA_VERSION,
+        build_normative_index,
+        build_patch_description,
+    )
+    from data.provenance import canonical_sha256, directory_file_sha256, sha256_file
+    from data.spatial_contract import PATCH_COORDINATE_CONTRACT
+    from preprocessing.conform import load_common_grid_contract
     from models.brainiac_wrapper import BrainIACWrapper
     from models.modernbert_wrapper import ModernBERTWrapper
     from graphs.image_graph import ImageGraphBuilder
     from graphs.mask_graph import MaskGraphBuilder
     from graphs.roi_graph import ROIGraphBuilder
     from graphs.hypergraph import HypergraphBuilder
-    from utils.config import load_config
+    from utils.config import load_config, resolve_configured_value
     from utils.scalers import FeatureScalerManager
 except ImportError as e:
     # Print debug info
@@ -121,9 +139,25 @@ def save_tensor(tensor: torch.Tensor, path: Path):
     np.save(str(path), tensor.cpu().numpy())
 
 
-def load_tensor(path: Path) -> torch.Tensor:
-    """Load tensor from numpy array."""
-    return torch.from_numpy(np.load(str(path)))
+def normative_context_hash(dataset: Connect4Dataset, patient_id: str) -> str:
+    """Fingerprint the subject text inputs so stale embeddings are not reused."""
+    subject = dataset.scan_to_normative_subject[str(patient_id)]
+    return canonical_sha256(
+        {
+            "workbook_sha256": dataset.normative_workbook_sha256,
+            "subject_rows": dataset.normative_source_rows[subject],
+        }
+    )
+
+
+def scaler_source_fingerprint(scaler_manager: FeatureScalerManager = None) -> Dict:
+    if scaler_manager is None or scaler_manager.scaler_dir is None:
+        return {"enabled": False}
+    directory = Path(scaler_manager.scaler_dir)
+    return {
+        "enabled": True,
+        "files_sha256": directory_file_sha256(directory),
+    }
 
 
 def process_single_sample(
@@ -141,6 +175,7 @@ def process_single_sample(
     brainiac_batch_size: int = 8,  # Very small default - patches resize from 16^3 to 96^3 (216x memory increase)
     text_batch_size: int = 512,
     scaler_manager: FeatureScalerManager = None,
+    external_protocol_context: Dict = None,
 ):
     """Process a single sample."""
     import sys
@@ -153,19 +188,99 @@ def process_single_sample(
         graphs_dir = output_dir / "graphs"
         hypergraphs_dir = output_dir / "hypergraphs"
         
-        scan_base = scan_id.split("_")[0]
+        normative_subject = dataset.scan_to_normative_subject[scan_id]
+        expected_normative_hash = normative_context_hash(dataset, scan_id)
+        cache_sources = {
+            "dataset": dataset.source_fingerprint(scan_id),
+            "brainiac": brainiac.source_fingerprint,
+            "modernbert": modernbert.source_fingerprint,
+            "scalers": scaler_source_fingerprint(scaler_manager),
+            "target_shape": list(dataset.target_shape),
+            "patch_size": list(dataset.patch_size),
+            "patch_description_schema_version": PATCH_DESCRIPTION_SCHEMA_VERSION,
+            "patch_coordinate_contract": dict(PATCH_COORDINATE_CONTRACT),
+            "functional_connectivity_sha256": canonical_sha256(
+                KNOWN_FUNCTIONAL_CONNECTIVITY
+            ),
+        }
+        if external_protocol_context is not None:
+            cache_sources["external_protocol"] = dict(external_protocol_context)
+            current_conditioning = conditioning_identity_from_cache_sources(
+                cache_sources
+            )
+            if current_conditioning != external_protocol_context.get(
+                "conditioning_identity"
+            ):
+                raise RuntimeError(
+                    "external preprocessing conditioning artifacts differ from "
+                    "the completed synthesis checkpoint"
+                )
+        cache_sources_sha256 = canonical_sha256(cache_sources)
         
-        # Check if already processed (skip to speed up)
+        # Check if already processed (skip to speed up).  Text schema changes
+        # invalidate ModernBERT embeddings, mask nodes, and downstream graphs.
         image_nodes_path = graphs_dir / f"{scan_id}_image_nodes.npy"
         image_emb_path = image_emb_dir / f"{scan_id}_image_patch_embeddings.npy"
         modernbert_emb_path = modernbert_emb_dir / f"{scan_id}_mask_patch_embeddings.npy"
+        metadata_path = hypergraphs_dir / f"{scan_id}_metadata.json"
+        patch_desc_path = hypergraphs_dir / f"{scan_id}_patch_descriptions.json"
+        description_cache_current = False
+        cached_metadata = {}
+        if metadata_path.exists() and patch_desc_path.exists():
+            try:
+                with open(metadata_path) as f:
+                    cached_metadata = json.load(f)
+                description_cache_current = (
+                    cached_metadata.get("patch_description_schema_version")
+                    == PATCH_DESCRIPTION_SCHEMA_VERSION
+                    and cached_metadata.get("normative_context_sha256")
+                    == expected_normative_hash
+                    and cached_metadata.get("source_fingerprint") == cache_sources
+                    and cached_metadata.get("source_fingerprint_sha256")
+                    == cache_sources_sha256
+                )
+            except (OSError, ValueError, TypeError):
+                description_cache_current = False
         if image_nodes_path.exists() and image_emb_path.exists() and modernbert_emb_path.exists():
             mask_nodes_path = graphs_dir / f"{scan_id}_mask_nodes.npy"
             roi_nodes_path = graphs_dir / f"{scan_id}_roi_nodes.npy"
             hyperedge_path = hypergraphs_dir / f"{scan_id}_hyperedge_index.npy"
-            if all(p.exists() for p in [mask_nodes_path, roi_nodes_path, hyperedge_path]):
-                print(f"  [{scan_id}] ✓ Already processed, skipping...", flush=True)
-                return None  # Already processed
+            hyperedge_weights_path = (
+                hypergraphs_dir / f"{scan_id}_hyperedge_weights.npy"
+            )
+            patch_distribution_path = (
+                hypergraphs_dir / f"{scan_id}_patch_distributions.json"
+            )
+            required_cached = [
+                image_nodes_path,
+                image_emb_path,
+                modernbert_emb_path,
+                mask_nodes_path,
+                roi_nodes_path,
+                hyperedge_path,
+                hyperedge_weights_path,
+                patch_distribution_path,
+                patch_desc_path,
+            ]
+            artifact_hashes = cached_metadata.get("artifact_sha256", {})
+            hashes_current = (
+                isinstance(artifact_hashes, dict)
+                and set(artifact_hashes)
+                == {path.name for path in required_cached}
+                and all(
+                    artifact_hashes[path.name] == sha256_file(path)
+                    for path in required_cached
+                )
+            )
+            if description_cache_current and hashes_current:
+                print(f"  [{scan_id}] ✓ Source-bound cache is current, skipping...", flush=True)
+                return []
+            if not description_cache_current:
+                print(
+                    f"  [{scan_id}] Cached text predates {PATCH_DESCRIPTION_SCHEMA_VERSION}; "
+                    "rebuilding text embeddings and dependent graphs...",
+                    flush=True,
+                )
         
         # Load sample
         sample = dataset[idx]
@@ -173,7 +288,8 @@ def process_single_sample(
         t1w = sample['t1w']  # [1, 1, D, H, W]
         mask = sample['mask']  # [1, 1, D, H, W]
         roi_embeddings = sample['roi_embeddings']  # [num_rois, embed_dim]
-        patch_distributions = sample['patch_distributions']
+        # Recomputed below from the label-preserving SynthSeg volume.  The
+        # sample's `mask` is a binary loss mask and cannot identify ROIs.
         structure_to_roi_idx = sample['structure_to_roi_idx']
         dwi_matrix = sample['dwi_matrix']
         
@@ -191,7 +307,7 @@ def process_single_sample(
         # 1. Patchify T1w and encode with BrainIAC (batch processing)
         t_image_pipe_start = time.time()
         t_bria_start = time.time()
-        # With 16x16x16 patches on 128x128x128 image = 512 patches (8x8x8 = 512)
+        # Patch count comes from the externally validated common-grid shape.
         print(f"  [{scan_id}] Patchifying T1w image...", flush=True)
         t1w_patches = dataset.patchifier.patchify(t1w.unsqueeze(0))  # List of patches
         num_patches = len(t1w_patches)
@@ -269,25 +385,19 @@ def process_single_sample(
         print(f"  [{scan_id}] BrainIAC encoding complete, stacking embeddings...", flush=True)
         image_patch_embeddings = torch.cat(image_patch_embeddings, dim=0)  # [num_patches, embed_dim]
         
-        # Apply scaler if available
-        if scaler_manager is not None:
-            print(f"  [{scan_id}] Applying BrainIAC scaler...", flush=True)
-            image_patch_embeddings = scaler_manager.scale_brainiac(image_patch_embeddings)
-        
         print(f"  [{scan_id}] BrainIAC total time: {time.time() - t_bria_start:.2f}s", flush=True)
         
         # Save all patch embeddings efficiently in a single file
         print(f"  [{scan_id}] Saving {num_patches} BrainIAC embeddings (single file)...", flush=True)
         emb_path = image_emb_dir / f"{scan_id}_image_patch_embeddings.npy"
-        if not emb_path.exists():
-            emb_path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(str(emb_path), image_patch_embeddings.numpy())
+        emb_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(emb_path), image_patch_embeddings.numpy())
         
         # 2. Build image graph
         t_img_graph_start = time.time()
         print(f"  [{scan_id}] Building image graph...", flush=True)
         spatial_shape = tuple(dataset.target_shape)
-        image_nodes, image_adj = image_graph_builder(
+        image_nodes, _ = image_graph_builder(
             image_patch_embeddings.unsqueeze(0),
             spatial_shape,
         )
@@ -295,7 +405,6 @@ def process_single_sample(
         # Save image graph
         print(f"  [{scan_id}] Saving image graph...", flush=True)
         save_tensor(image_nodes.squeeze(0), graphs_dir / f"{scan_id}_image_nodes.npy")
-        save_tensor(image_adj.squeeze(0), graphs_dir / f"{scan_id}_image_adj.npy")
         print(f"  [{scan_id}] Image graph time: {time.time() - t_img_graph_start:.2f}s", flush=True)
         print(f"  [{scan_id}] Image pipeline total: {time.time() - t_image_pipe_start:.2f}s", flush=True)
         
@@ -303,17 +412,42 @@ def process_single_sample(
         t_mask_pipe_start = time.time()
         print(f"  [{scan_id}] Patchifying mask and computing distributions...", flush=True)
         t_mask_text_start = time.time()
-        mask_patches = dataset.patchifier.patchify(mask.unsqueeze(0))
-        
         patch_text_descriptions = []
         mask_patch_embeddings_list = []
         
-        # Load mask header for center of mass
-        import nibabel as nib
-        mask_path = dataset.root / "Masks" / f"{scan_id}_mask.nii.gz"
-        mask_img = nib.load(str(mask_path))
-        orig_shape = mask_img.shape[:3]
-        affine = mask_img.affine
+        # Reload the label-preserving SynthSeg mask.  Connect4Dataset also
+        # exposes a binary brain mask for losses; using that here erases ROI
+        # identities and yields empty ROI distributions.
+        labelled_mask = sample["segmentation"]
+        affine = sample["affine"].cpu().numpy()
+        patch_distributions = []
+        for patch_idx in range(num_patches):
+            raw_distribution = dataset._compute_patch_distribution(labelled_mask, patch_idx)
+            patch_distributions.append({
+                int(structure_id): float(coverage)
+                for structure_id, coverage in raw_distribution.items()
+                if int(structure_id) in dataset.ID_TO_SLUG and float(coverage) > 0.0
+            })
+        # MaskGraphBuilder needs the same labelled mask to construct its DWI
+        # adjacency.  Its public shape is [C,D,H,W] before the batch is added.
+        mask = labelled_mask.squeeze(0).to(device)
+        normative_index = build_normative_index(dataset.normative_descriptions)
+        present_slugs = {
+            dataset.ID_TO_SLUG[structure_id]
+            for distribution in patch_distributions
+            for structure_id in distribution
+        }
+        missing_normative_slugs = sorted(
+            slug for slug in present_slugs
+            if dataset.SLUG_TO_ID[slug] in dataset.POTVIN_ROI_IDS
+            and (normative_subject, slug) not in normative_index
+        )
+        if missing_normative_slugs:
+            raise ValueError(
+                f"{scan_id} is missing subject-specific normative descriptions for "
+                f"{len(missing_normative_slugs)} present ROIs: {', '.join(missing_normative_slugs)}. "
+                "Paper-faithful patch text requires both connectivity and normative context."
+            )
         
         text_descriptions = []
         for patch_idx in range(num_patches):
@@ -322,30 +456,20 @@ def process_single_sample(
             # Compute center of mass
             x_mm, y_mm, z_mm = dataset._compute_patch_center_mm(
                 patch_idx,
-                orig_shape=orig_shape,
+                segmentation=labelled_mask,
                 affine=affine,
             )
             
-            # Create text description
-            desc_parts = [
-                f"Patch {patch_idx} at center ({x_mm:.1f}, {y_mm:.1f}, {z_mm:.1f}) mm "
-                f"contains {len(dist)} structures:"
-            ]
-            
-            for struct_id, coverage in sorted(dist.items(), key=lambda x: x[1], reverse=True):
-                struct_slug = dataset.ID_TO_SLUG.get(struct_id, f"structure_{struct_id}")
-                struct_name_readable = struct_slug.replace("_", " ")
-                base_text = f"{struct_name_readable} ({coverage*100:.1f}%)."
-                
-                # Append normative description
-                norm_key = (scan_base, struct_slug)
-                norm_text = dataset.normative_descriptions.get(norm_key, "")
-                if norm_text:
-                    desc_parts.append(f"{base_text} {norm_text}")
-                else:
-                    desc_parts.append(base_text)
-            
-            text_desc = " ".join(desc_parts)
+            # Each ROI summary deliberately contains both known functional
+            # connectivity and the subject-specific normative volume context.
+            text_desc = build_patch_description(
+                patch_idx=patch_idx,
+                center_mm=(x_mm, y_mm, z_mm),
+                distribution=dist,
+                id_to_slug=dataset.ID_TO_SLUG,
+                normative_index=normative_index,
+                patient_id=normative_subject,
+            )
             patch_text_descriptions.append(text_desc)
             
             # Store for CSV
@@ -357,14 +481,14 @@ def process_single_sample(
                 'center_x_mm': x_mm,
                 'center_y_mm': y_mm,
                 'center_z_mm': z_mm,
+                'description_schema_version': PATCH_DESCRIPTION_SCHEMA_VERSION,
             })
         
         # Save raw patch descriptions (pre-ModernBERT) for inspection/reuse
-        patch_desc_path = hypergraphs_dir / f"{scan_id}_patch_descriptions.json"
-        if not patch_desc_path.exists():
-            print(f"  [{scan_id}] Saving raw patch descriptions...", flush=True)
-            with open(patch_desc_path, 'w') as f:
-                json.dump(patch_text_descriptions, f, indent=2)
+        print(f"  [{scan_id}] Saving raw patch descriptions...", flush=True)
+        patch_desc_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(patch_desc_path, 'w') as f:
+            json.dump(patch_text_descriptions, f, indent=2)
         
         # 4. Encode text descriptions with ModernBERT
         print(f"  [{scan_id}] Encoding {len(patch_text_descriptions)} text descriptions with ModernBERT...", flush=True)
@@ -390,21 +514,19 @@ def process_single_sample(
         else:
             mask_patch_embeddings = torch.stack(mask_patch_embeddings_list)
         
-        # Apply scaler if available
-        if scaler_manager is not None:
-            print(f"  [{scan_id}] Applying ModernBERT scaler...", flush=True)
-            mask_patch_embeddings = scaler_manager.scale_modernbert(mask_patch_embeddings)
-        
         print(f"  [{scan_id}] ModernBERT total time: {time.time() - t_modern_start:.2f}s", flush=True)
         print(f"  [{scan_id}] Mask/text prep total time: {time.time() - t_mask_text_start:.2f}s", flush=True)
         
         # Save all ModernBERT embeddings efficiently in a single file
         print(f"  [{scan_id}] Saving {len(mask_patch_embeddings)} ModernBERT embeddings (single file)...", flush=True)
         modernbert_emb_path = modernbert_emb_dir / f"{scan_id}_mask_patch_embeddings.npy"
-        if not modernbert_emb_path.exists():
-            modernbert_emb_path.parent.mkdir(parents=True, exist_ok=True)
-            embeddings_np = mask_patch_embeddings.numpy() if isinstance(mask_patch_embeddings, torch.Tensor) else mask_patch_embeddings
-            np.save(str(modernbert_emb_path), embeddings_np)
+        modernbert_emb_path.parent.mkdir(parents=True, exist_ok=True)
+        embeddings_np = (
+            mask_patch_embeddings.detach().cpu().numpy()
+            if isinstance(mask_patch_embeddings, torch.Tensor)
+            else mask_patch_embeddings
+        )
+        np.save(str(modernbert_emb_path), embeddings_np)
         
         # 5. Build mask graph
         t_mask_graph_start = time.time()
@@ -413,7 +535,7 @@ def process_single_sample(
             label_id: slug
             for slug, label_id in dataset.ROI_SPECS
         }
-        mask_nodes, mask_adj = mask_graph_builder(
+        mask_nodes, _ = mask_graph_builder(
             mask_patch_embeddings.unsqueeze(0),
             mask.unsqueeze(0),
             spatial_shape,
@@ -425,11 +547,10 @@ def process_single_sample(
         print(f"  [{scan_id}] Mask graph time: {time.time() - t_mask_graph_start:.2f}s", flush=True)
         # Save mask graph
         save_tensor(mask_nodes.squeeze(0), graphs_dir / f"{scan_id}_mask_nodes.npy")
-        save_tensor(mask_adj.squeeze(0), graphs_dir / f"{scan_id}_mask_adj.npy")
         
         # 6. Build ROI graph (roi_embeddings already has scalers applied from dataset)
         t_roi_graph_start = time.time()
-        roi_nodes, roi_adj = roi_graph_builder(
+        roi_nodes, _ = roi_graph_builder(
             roi_embeddings.unsqueeze(0),
             dwi_matrix=dwi_matrix,
         )
@@ -437,8 +558,6 @@ def process_single_sample(
         
         # Save ROI graph
         save_tensor(roi_nodes.squeeze(0), graphs_dir / f"{scan_id}_roi_nodes.npy")
-        save_tensor(roi_adj.squeeze(0), graphs_dir / f"{scan_id}_roi_adj.npy")
-        save_tensor(roi_embeddings, graphs_dir / f"{scan_id}_roi_embeddings.npy")
         
         # 7. Build hypergraph
         t_hyper_start = time.time()
@@ -469,6 +588,34 @@ def process_single_sample(
             'num_rois': dataset.NUM_ROIS,
             'spatial_shape': list(spatial_shape),
             'patch_size': list(dataset.patch_size),
+            'patch_description_schema_version': PATCH_DESCRIPTION_SCHEMA_VERSION,
+            'patch_coordinate_contract': dict(PATCH_COORDINATE_CONTRACT),
+            'structural_grid_geometry': cache_sources['dataset'][
+                'structural_grid_geometry'
+            ],
+            'normative_context_sha256': expected_normative_hash,
+            'source_fingerprint': cache_sources,
+            'source_fingerprint_sha256': cache_sources_sha256,
+            'patch_text_components': [
+                'roi_distribution_and_patch_center',
+                'known_functional_connectivity',
+                'subject_specific_normative_volume',
+            ],
+            'potvin_supported_roi_ids': sorted(dataset.POTVIN_ROI_IDS),
+        }
+        artifact_paths = [
+            graphs_dir / f"{scan_id}_image_nodes.npy",
+            image_emb_path,
+            modernbert_emb_path,
+            graphs_dir / f"{scan_id}_mask_nodes.npy",
+            graphs_dir / f"{scan_id}_roi_nodes.npy",
+            hypergraphs_dir / f"{scan_id}_hyperedge_index.npy",
+            hypergraphs_dir / f"{scan_id}_hyperedge_weights.npy",
+            hypergraphs_dir / f"{scan_id}_patch_distributions.json",
+            patch_desc_path,
+        ]
+        metadata['artifact_sha256'] = {
+            path.name: sha256_file(path) for path in artifact_paths
         }
         with open(hypergraphs_dir / f"{scan_id}_metadata.json", 'w') as f:
             json.dump(metadata, f, indent=2)
@@ -482,7 +629,7 @@ def process_single_sample(
         print(f"Error processing {scan_id}: {e}")
         import traceback
         traceback.print_exc()
-        return None
+        raise RuntimeError(f"graph preprocessing failed for {scan_id}") from e
 
 
 def init_worker(gpu_id):
@@ -525,8 +672,7 @@ def worker_process(
     
     # Verify CUDA is available
     if not torch.cuda.is_available():
-        print(f"[GPU {gpu_id}] ERROR: CUDA not available in worker!", flush=True)
-        return []
+        raise RuntimeError(f"CUDA is not available in graph worker {gpu_id}")
     
     # Set GPU device - in spawn mode with CUDA_VISIBLE_DEVICES set, each process sees only one GPU
     # So we use cuda:0 in each worker (which maps to the actual GPU assigned via CUDA_VISIBLE_DEVICES)
@@ -541,10 +687,13 @@ def worker_process(
         root_dir=dataset_config['root_dir'],
         patch_size=tuple(dataset_config['patch_size']),
         target_shape=tuple(dataset_config['target_shape']),
+        common_grid_contract_sha256=dataset_config.get(
+            'common_grid_contract_sha256'
+        ),
         dwi_matrix_path=dataset_config['dwi_matrix_path'],
-        normalize_intensity=dataset_config['normalize_intensity'],
-        brainiac_model_path=dataset_config.get('brainiac_model_path'),
-        modernbert_model_path=dataset_config['modernbert_model_path'],
+        normative_csv_path=dataset_config['normative_csv_path'],
+        cohort_manifest_path=dataset_config['cohort_manifest_path'],
+        scaler_dir=dataset_config.get('scaler_dir'),
     )
     print(f"[GPU {gpu_id}] Dataset created with {len(dataset)} samples", flush=True)
     
@@ -554,6 +703,12 @@ def worker_process(
         model_path=dataset_config.get('brainiac_model_path'),
         embed_dim=dataset_config.get('brainiac_embed_dim', 768),
         device=str(device),
+        expected_checkpoint_sha256=dataset_config.get(
+            'brainiac_checkpoint_sha256'
+        ),
+        expected_source_fingerprint_sha256=dataset_config.get(
+            'brainiac_source_sha256'
+        ),
     ).to(device)
     brainiac.eval()  # Set to eval mode
     print(f"[GPU {gpu_id}] BrainIAC loaded", flush=True)
@@ -562,6 +717,7 @@ def worker_process(
     modernbert = ModernBERTWrapper(
         model_path=dataset_config['modernbert_model_path'],
         embed_dim=dataset_config['modernbert_embed_dim'],
+        revision=dataset_config.get('modernbert_revision'),
     ).to(device)
     print(f"[GPU {gpu_id}] ModernBERT loaded", flush=True)
     
@@ -597,18 +753,27 @@ def worker_process(
     
     # Process samples assigned to this GPU
     text_descriptions = []
+    completed_scan_ids = []
     total = len(sample_indices)
     for i, idx in enumerate(sample_indices):
         scan_id = dataset.scan_ids[idx]
         print(f"[GPU {gpu_id}] Processing sample {i+1}/{total}: {scan_id}", flush=True)
         
         # Load scaler manager if available
-        scaler_manager = None
-        if dataset_config.get('scaler_dir'):
-            scaler_dir = Path(dataset_config['scaler_dir'])
-            if scaler_dir.exists():
-                scaler_manager = FeatureScalerManager()
-                scaler_manager.load_scalers(scaler_dir)
+        scaler_path = dataset_config.get('scaler_dir')
+        if not scaler_path:
+            raise RuntimeError("graph worker has no certified scaler directory")
+        scaler_dir = Path(scaler_path)
+        if not scaler_dir.is_dir():
+            raise FileNotFoundError(
+                f"graph worker scaler directory not found: {scaler_dir}"
+            )
+        scaler_manager = FeatureScalerManager(scaler_dir)
+        scaler_manager.load_scalers(scaler_dir)
+        if set(scaler_manager.scalers) != {'radiomics', 'anatcl'}:
+            raise RuntimeError(
+                "graph workers require exactly the radiomics and AnatCL scalers"
+            )
         
         result = process_single_sample(
             idx, scan_id, dataset, output_dir,
@@ -617,21 +782,26 @@ def worker_process(
             roi_graph_builder, hypergraph_builder,
             device, brainiac_batch_size, text_batch_size,
             scaler_manager=scaler_manager,
+            external_protocol_context=dataset_config.get("external_protocol_context"),
         )
         if result:
             text_descriptions.extend(result)
+        completed_scan_ids.append(scan_id)
         
         if (i + 1) % 10 == 0:
             print(f"[GPU {gpu_id}] Completed {i+1}/{total} samples", flush=True)
     
     print(f"[GPU {gpu_id}] Finished processing all {total} samples", flush=True)
-    return text_descriptions
+    return {
+        "scan_ids": completed_scan_ids,
+        "text_descriptions": text_descriptions,
+    }
 
 
 def compute_scalers_from_dataset(
     dataset: Connect4Dataset,
     output_dir: Path,
-    max_samples: int = None,  # Limit samples for scaler fitting (None = all)
+    sample_indices: List[int] = None,
 ):
     """
     Compute scalers from all training data.
@@ -649,35 +819,26 @@ def compute_scalers_from_dataset(
     all_brainiac_embeddings = []
     all_modernbert_embeddings = []
     
-    num_samples = len(dataset) if max_samples is None else min(max_samples, len(dataset))
-    print(f"Collecting features from {num_samples} samples...", flush=True)
+    indices = (
+        list(range(len(dataset))) if sample_indices is None else list(sample_indices)
+    )
+    if not indices:
+        raise ValueError("the scaler-fitting training partition cannot be empty")
+    if len(set(indices)) != len(indices):
+        raise ValueError("the scaler-fitting training partition contains duplicates")
+    if any(index < 0 or index >= len(dataset) for index in indices):
+        raise IndexError("the scaler-fitting training partition contains an invalid index")
+    print(
+        f"Collecting features from {len(indices)} training-partition samples...",
+        flush=True,
+    )
     
-    for idx in tqdm(range(num_samples), desc="Collecting features"):
-        try:
-            scan_id = dataset.scan_ids[idx]
-            
-            # Collect radiomics features (same for all samples, but collect once per ROI)
-            if idx == 0:
-                for structure_id, feats in dataset.radiomics_features.items():
-                    if feats is not None:
-                        all_radiomics.append(feats)
-            
-            # Collect AnatCL embeddings
-            try:
-                anatcl_embs = dataset._load_anatcl_embeddings(scan_id)
-                for slug, emb in anatcl_embs.items():
-                    if emb is not None:
-                        all_anatcl_embeddings.append(emb)
-            except Exception as e:
-                print(f"Warning: Could not load AnatCL embeddings for {scan_id}: {e}", flush=True)
-            
-            # Note: BrainIAC and ModernBERT embeddings are computed during preprocessing,
-            # so we'll collect them during the preprocessing phase
-            # For now, we'll fit scalers on a subset during preprocessing
-            
-        except Exception as e:
-            print(f"Warning: Error processing sample {idx} ({scan_id if 'scan_id' in locals() else 'unknown'}): {e}", flush=True)
-            continue
+    for idx in tqdm(indices, desc="Collecting features"):
+        scan_id = dataset.scan_ids[idx]
+        for features in dataset.radiomics_for_scan(scan_id).values():
+            all_radiomics.append(features)
+        anatcl_embeddings = dataset._load_anatcl_embeddings(scan_id)
+        all_anatcl_embeddings.extend(anatcl_embeddings.values())
     
     # Fit scalers
     print("\nFitting scalers...", flush=True)
@@ -695,6 +856,20 @@ def compute_scalers_from_dataset(
     # Save scalers
     scaler_dir = output_dir / "scalers"
     scaler_manager.save_scalers(scaler_dir)
+    scaler_manager.scaler_dir = scaler_dir
+    training_scan_ids = sorted(dataset.scan_ids[index] for index in indices)
+    with open(scaler_dir / "training_partition.json", "w") as stream:
+        json.dump(
+            {
+                "schema": "connect4-training-only-scalers-v1",
+                "training_partition_scan_ids": training_scan_ids,
+                "fitted_scan_ids": training_scan_ids,
+            },
+            stream,
+            indent=2,
+        )
+        stream.write("\n")
+    validate_training_scaler_provenance(str(scaler_dir), training_scan_ids)
     
     print(f"\n✓ Scalers computed and saved to {scaler_dir}")
     return scaler_manager
@@ -708,6 +883,7 @@ def preprocess_dataset_multi_gpu(
     text_batch_size: int = 512,
     config: Dict = None,
     scaler_manager: FeatureScalerManager = None,
+    external_protocol_context: Dict = None,
 ):
     """Preprocess entire dataset using multiple GPUs in parallel."""
     
@@ -723,19 +899,61 @@ def preprocess_dataset_multi_gpu(
         'root_dir': str(dataset.root),
         'patch_size': list(dataset.patch_size),
         'target_shape': list(dataset.target_shape),
+        'common_grid_contract_sha256': dataset.common_grid_contract_sha256,
         'dwi_matrix_path': config['data']['dwi_matrix_path'] if config else str(dataset.root / "dwi_matrix.csv"),
-        'normalize_intensity': dataset.normalize_intensity,
+        'normative_csv_path': (
+            config['data'].get('normative_csv_path')
+            if config and config['data'].get('normative_csv_path')
+            else str(dataset.root / "patient_roi_normative_inputs.csv")
+        ),
+        'cohort_manifest_path': config['data']['cohort_manifest'],
         'brainiac_model_path': config['models'].get('brainiac_path') if config else None,
-        'modernbert_model_path': config['models'].get('modernbert_path') if config else None,
-        'brainiac_embed_dim': config['models'].get('brainiac', {}).get('embed_dim', 768) if config else 768,
-        'modernbert_embed_dim': config['models']['modernbert']['embed_dim'] if config else 768,
+        'brainiac_checkpoint_sha256': (
+            resolve_configured_value(
+                config['models'],
+                'brainiac_checkpoint_sha256',
+                'brainiac_checkpoint_sha256_env',
+            ) if config else None
+        ),
+        'brainiac_source_sha256': (
+            resolve_configured_value(
+                config['models'],
+                'brainiac_source_sha256',
+                'brainiac_source_sha256_env',
+            ) if config else None
+        ),
+        'modernbert_model_path': (
+            config['models'].get('modernbert_name')
+            or config['models'].get('modernbert_path')
+        ) if config else None,
+        'modernbert_revision': (
+            config['models'].get('modernbert_revision') if config else None
+        ),
+        'brainiac_embed_dim': (
+            config['models']['fusion'].get('image_embed_dim', 768)
+            if config else 768
+        ),
+        'modernbert_embed_dim': (
+            config['models']['fusion'].get('mask_embed_dim', 768)
+            if config else 768
+        ),
         'num_rois': dataset.NUM_ROIS,
-        'k_neighbors': config['graphs']['image']['k_neighbors'] if config else 5,
-        'scaler_dir': str(output_dir / "scalers") if scaler_manager else None,
+        'k_neighbors': config['models']['graphs'].get('k_neighbors', 5) if config else 5,
+        'scaler_dir': (
+            str(scaler_manager.scaler_dir)
+            if scaler_manager is not None and scaler_manager.scaler_dir is not None
+            else (str(output_dir / "scalers") if scaler_manager is not None else None)
+        ),
+        'external_protocol_context': external_protocol_context,
     }
     
     # Split samples across GPUs
     num_samples = len(dataset)
+    if num_gpus < 1 or num_gpus > num_samples:
+        raise ValueError(
+            f"num_gpus must be between 1 and the {num_samples} cohort scans; "
+            f"got {num_gpus}"
+        )
     samples_per_gpu = num_samples // num_gpus
     remainder = num_samples % num_gpus
     
@@ -898,9 +1116,10 @@ with open(result_file, 'wb') as f:
             t.join()
         
         # Collect results from completed processes
+        failed_workers = []
         for gpu_id, p, temp_file in processes:
             if p.returncode != 0:
-                print(f"Warning: GPU {gpu_id} process exited with code {p.returncode}", flush=True)
+                failed_workers.append((gpu_id, p.returncode))
             else:
                 # Load result
                 result_file = temp_file.replace('.pkl', '_result.pkl')
@@ -914,6 +1133,14 @@ with open(result_file, 'wb') as f:
         # Clean up wrapper script
         if wrapper_path.exists():
             wrapper_path.unlink()
+
+        missing_results = [index for index, result in enumerate(results) if result is None]
+        if failed_workers or missing_results:
+            raise RuntimeError(
+                "one or more graph-preprocessing workers failed; the fixed cohort "
+                f"will not be reduced silently (workers={failed_workers}, "
+                f"missing_results={missing_results})"
+            )
         
         print("All worker processes completed!", flush=True)
     except Exception as e:
@@ -922,11 +1149,21 @@ with open(result_file, 'wb') as f:
         traceback.print_exc()
         raise
     
-    # Collect all text descriptions
+    # Every worker returns an explicit list of completed scan IDs, including
+    # source-bound cache hits. This proves a rerun covered the fixed cohort.
     all_text_descriptions = []
+    completed_scan_ids = []
     for result in results:
-        if result:
-            all_text_descriptions.extend(result)
+        if not isinstance(result, dict):
+            raise RuntimeError("graph worker returned an invalid completion record")
+        all_text_descriptions.extend(result.get("text_descriptions", []))
+        completed_scan_ids.extend(result.get("scan_ids", []))
+    if sorted(completed_scan_ids) != sorted(dataset.scan_ids):
+        raise RuntimeError(
+            "graph preprocessing did not certify every fixed-cohort scan; "
+            f"completed={sorted(completed_scan_ids)[:10]}, "
+            f"expected={sorted(dataset.scan_ids)[:10]}"
+        )
     
     # Save text descriptions CSV
     if all_text_descriptions:
@@ -941,56 +1178,254 @@ with open(result_file, 'wb') as f:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--output_dir', type=str, default='/path/to/data/precomputed_graphs', help='Output directory')
+    parser.add_argument(
+        '--mode',
+        choices=('training', 'external'),
+        default='training',
+        help=(
+            'training fits/validates the fixed A4+ADNI preprocessing state; '
+            'external prepares a checkpoint-proven unseen structural-only cohort'
+        ),
+    )
+    parser.add_argument(
+        '--synthesis_checkpoint',
+        default=None,
+        help='completed synthesis checkpoint (required only with --mode external)',
+    )
+    parser.add_argument(
+        '--output_dir', type=str, default=None,
+        help='Output directory (defaults to data.precomputed_dir in the config)',
+    )
     parser.add_argument('--num_gpus', type=int, default=4, help='Number of GPUs to use')
     parser.add_argument('--brainiac_batch_size', type=int, default=16, help='Batch size for BrainIAC encoding (default 16; falls back on OOM)')
     parser.add_argument('--text_batch_size', type=int, default=1024, help='Batch size for ModernBERT encoding')
+    parser.add_argument(
+        '--normative_csv_path',
+        type=str,
+        default=None,
+        help=(
+            'Raw per-subject Potvin input CSV (measured volume, age, sex, scanner, '
+            'field strength, and ICV). Defaults to data.normative_csv_path in the '
+            'config, then <root_dir>/patient_roi_normative_inputs.csv.'
+        ),
+    )
     parser.add_argument('--skip_scaler_computation', action='store_true', help='Skip scaler computation (use existing scalers)')
-    parser.add_argument('--scaler_max_samples', type=int, default=None, help='Max samples to use for scaler fitting (None = all)')
     args = parser.parse_args()
     
     # Load config
     config = load_config(args.config)
+    validate_fixed_protocol_config(config)
+    graph_config = config['models']['graphs']
+    fusion_config = config['models']['fusion']
+    common_grid = load_common_grid_contract(
+        config['data']['common_grid_contract_path'],
+        expected_sha256=resolve_configured_value(
+            config['data'],
+            'common_grid_contract_sha256',
+            'common_grid_contract_sha256_env',
+        ),
+    )
+    if tuple(config['data']['architecture_shape']) != tuple(
+        common_grid['architecture_shape']
+    ):
+        raise ValueError(
+            "data.architecture_shape differs from the hash-bound common-grid contract"
+        )
+    cohort_manifest = config['data'].get('cohort_manifest')
+    if not cohort_manifest:
+        raise ValueError(
+            "data.cohort_manifest is required so graph preprocessing proves the "
+            "complete explicit patient/cohort identity"
+        )
+    normative_csv_path = (
+        args.normative_csv_path
+        or config['data'].get('normative_csv_path')
+        or str(Path(config['data']['root_dir']) / 'patient_roi_normative_inputs.csv')
+    )
+    # Propagate the resolved path to spawned workers without requiring a config
+    # schema change for existing runs.
+    config['data']['normative_csv_path'] = normative_csv_path
+    if not Path(normative_csv_path).is_file():
+        raise FileNotFoundError(
+            f"Raw Potvin input CSV not found at {normative_csv_path}. It is required "
+            "for subject-specific paper patch text."
+        )
     
     # Create dataset (for getting scan IDs and config)
     dataset = Connect4Dataset(
         root_dir=config['data']['root_dir'],
-        patch_size=tuple(config['data']['patch_size']),
-        target_shape=tuple(config['data']['target_shape']),
+        patch_size=tuple(graph_config['patch_size']),
+        target_shape=tuple(config['data']['architecture_shape']),
+        common_grid_contract_sha256=common_grid['contract_sha256'],
         dwi_matrix_path=config['data']['dwi_matrix_path'],
-        normalize_intensity=config['data']['normalize_intensity'],
-        brainiac_model_path=config['models'].get('brainiac_path'),
-        modernbert_model_path=config['models'].get('modernbert_path'),
+        normative_csv_path=normative_csv_path,
+        cohort_manifest_path=cohort_manifest,
     )
+    if not dataset.normative_descriptions:
+        raise ValueError(
+            f"No valid per-subject normative descriptions were loaded from {normative_csv_path}. "
+            "Check PatientID/Structure columns and normative values."
+        )
+    normalised_norms = build_normative_index(dataset.normative_descriptions)
+    missing_roi_norms = [
+        (scan_id, slug)
+        for scan_id in dataset.scan_ids
+        for label_id, slug in dataset.ID_TO_SLUG.items()
+        if label_id in dataset.POTVIN_ROI_IDS
+        and (dataset.scan_to_normative_subject[scan_id], slug) not in normalised_norms
+    ]
+    if missing_roi_norms:
+        preview = ', '.join(f"{scan}:{slug}" for scan, slug in missing_roi_norms[:10])
+        raise ValueError(
+            f"Subject-specific Potvin text is missing for {len(missing_roi_norms)} "
+            f"scan/ROI pairs (first: {preview}). All 23 individual workbook models "
+            "are required; the remaining nine CONNECT-4 ROIs have no individual "
+            "Potvin model and are not fabricated."
+        )
+
+    output_dir = Path(args.output_dir or config['data']['precomputed_dir'])
+
+    # Lock the manuscript's patient-disjoint partitions before fitting any
+    # data-dependent transform. External mode instead proves that every scan is
+    # absent from the completed synthesis run and never fits a transform.
+    external_protocol_context = None
+    completed_checkpoint = None
+    if args.mode == 'external':
+        if not args.synthesis_checkpoint:
+            raise ValueError(
+                "--mode external requires --synthesis_checkpoint from a completed run"
+            )
+        if args.skip_scaler_computation:
+            raise ValueError(
+                "--skip_scaler_computation is a training-mode option; external mode "
+                "always requires and reuses checkpoint-bound training scalers"
+            )
+        completed_checkpoint, _, checkpoint_sha256 = (
+            load_completed_synthesis_checkpoint(args.synthesis_checkpoint)
+        )
+        cohort_evidence, external_protocol_context = (
+            build_external_cache_protocol_context(
+                manifest_path=cohort_manifest,
+                scan_ids=dataset.scan_ids,
+                synthesis_split_identity=completed_checkpoint['split_identity'],
+                synthesis_artifact_identity=completed_checkpoint['artifact_identity'],
+                synthesis_checkpoint_sha256=checkpoint_sha256,
+            )
+        )
+        print(
+            "External structural cohort certified as unseen: "
+            f"scans={len(dataset.scan_ids)}, "
+            f"patients={len(set(cohort_evidence.patient_by_scan.values()))}, "
+            f"cohorts={sorted(set(cohort_evidence.cohort_by_scan.values()))}",
+            flush=True,
+        )
+        train_indices = validation_indices = test_indices = None
+    else:
+        if args.synthesis_checkpoint:
+            raise ValueError(
+                "--synthesis_checkpoint is valid only with --mode external"
+            )
+        cohort_evidence = validate_training_cohort_manifest(
+            cohort_manifest,
+            dataset.scan_ids,
+            expected_scan_counts=config['data'].get('expected_cohort_scan_counts'),
+            protocol_profile=config['data'].get('protocol_profile'),
+        )
+        train_indices, validation_indices, test_indices = (
+            patient_level_split_from_manifest(
+                dataset.scan_ids,
+                cohort_evidence.patient_by_scan,
+                val_frac=config['training'].get('val_frac', 0.15),
+                test_frac=config['training'].get('test_frac', 0.15),
+                seed=config['training'].get('seed', 42),
+                manifest_path=config['training'].get('split_manifest'),
+                manifest_sha256=resolve_configured_value(
+                    config['training'],
+                    'split_manifest_sha256',
+                    'split_manifest_sha256_env',
+                ),
+                protocol_profile=str(config['data'].get('protocol_profile', '')),
+            )
+        )
+        print(
+            "Patient-disjoint preprocessing partitions: "
+            f"train={len(train_indices)}, validation={len(validation_indices)}, "
+            f"test={len(test_indices)}",
+            flush=True,
+        )
     
     # Verify patch size
     num_patches = np.prod([
-        config['data']['target_shape'][i] // config['data']['patch_size'][i]
+        config['data']['architecture_shape'][i] // graph_config['patch_size'][i]
         for i in range(3)
     ])
-    print(f"Patch size: {config['data']['patch_size']}")
-    print(f"Target shape: {config['data']['target_shape']}")
-    print(f"Number of patches per sample: {num_patches} (should be 512 for 16x16x16 patches)")
-    
-    output_dir = Path(args.output_dir)
+    if int(fusion_config['num_rois']) != dataset.NUM_ROIS:
+        raise ValueError(
+            f"models.fusion.num_rois={fusion_config['num_rois']} but the "
+            f"CONNECT-4 segmentation defines {dataset.NUM_ROIS} ROIs"
+        )
+    print(f"Patch size: {graph_config['patch_size']}")
+    print(f"Architecture shape: {config['data']['architecture_shape']}")
+    print(
+        f"Number of padded-grid patches per sample: {num_patches} "
+        "(a versioned recovery choice, not a paper-reported count)"
+    )
     
     # Compute scalers if not skipping
     scaler_manager = None
-    if not args.skip_scaler_computation:
+    if args.mode == 'external':
+        scaler_dir = config['data'].get('scaler_dir')
+        validate_external_scaler_provenance(
+            scaler_dir,
+            dataset.scan_ids,
+            completed_checkpoint['artifact_identity'],
+            completed_checkpoint['split_identity'],
+        )
+        scaler_manager = FeatureScalerManager(Path(scaler_dir))
+        scaler_manager.load_scalers(Path(scaler_dir))
+        required_scalers = {'radiomics', 'anatcl'}
+        if set(scaler_manager.scalers) != required_scalers:
+            raise RuntimeError(
+                "external preprocessing requires the checkpoint-bound radiomics "
+                "and AnatCL synthesis-training scalers"
+            )
+        print(
+            f"Loaded immutable synthesis-training scalers from {scaler_dir}",
+            flush=True,
+        )
+    elif not args.skip_scaler_computation:
         scaler_manager = compute_scalers_from_dataset(
             dataset,
             output_dir,
-            max_samples=args.scaler_max_samples,
+            sample_indices=train_indices,
         )
     else:
         # Load existing scalers
         scaler_dir = output_dir / "scalers"
         if scaler_dir.exists():
-            scaler_manager = FeatureScalerManager()
+            expected_scaler_ids = sorted(dataset.scan_ids[index] for index in train_indices)
+            try:
+                validate_training_scaler_provenance(
+                    str(scaler_dir), expected_scaler_ids
+                )
+            except (RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Existing scalers were not fitted on exactly the current fixed "
+                    "training partition. Refit them before paper-faithful preprocessing."
+                ) from exc
+            scaler_manager = FeatureScalerManager(scaler_dir)
             scaler_manager.load_scalers(scaler_dir)
             print(f"Loaded existing scalers from {scaler_dir}", flush=True)
         else:
-            print(f"Warning: Scaler directory not found: {scaler_dir}. Proceeding without scalers.", flush=True)
+            raise FileNotFoundError(
+                f"--skip_scaler_computation requires the existing, provenance-bound "
+                f"training scalers at {scaler_dir}"
+            )
+
+    if scaler_manager is None or set(scaler_manager.scalers) != {'radiomics', 'anatcl'}:
+        raise RuntimeError(
+            "graph preprocessing requires exactly the radiomics and AnatCL scalers"
+        )
     
     # Run multi-GPU preprocessing
     preprocess_dataset_multi_gpu(
@@ -1001,6 +1436,7 @@ def main():
         text_batch_size=args.text_batch_size,
         config=config,
         scaler_manager=scaler_manager,
+        external_protocol_context=external_protocol_context,
     )
 
 

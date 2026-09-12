@@ -4,6 +4,7 @@ import torch
 from torch import Tensor, nn
 import sys
 from pathlib import Path
+from data.provenance import canonical_sha256, sha256_file
 
 # Locate the BrainIAC source tree robustly. Search, in order:
 #   1. $CONNECT4_BRAINIAC                       (explicit override)
@@ -38,6 +39,48 @@ else:
           "Set $CONNECT4_BRAINIAC or place BrainIAC/ at the repo root.")
 
 
+def _required_sha256(value: Optional[str], label: str) -> str:
+    digest = str(value or "").strip().lower()
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"{label} must be a complete lowercase SHA-256 digest")
+    return digest
+
+
+def brainiac_source_fingerprint(model_path: str, *, embed_dim: int = 768) -> dict:
+    """Bind BrainIAC weights to its loader/architecture code and adapter."""
+    if BRAINIAC_ROOT is None:
+        raise RuntimeError("BrainIAC source root is unavailable for provenance")
+    source_root = Path(BRAINIAC_ROOT).resolve()
+    source_files = {
+        "connect4/models/brainiac_wrapper.py": sha256_file(Path(__file__).resolve())
+    }
+    source_files.update(
+        {
+            f"brainiac/{path.relative_to(source_root).as_posix()}": sha256_file(path)
+            for path in sorted(source_root.rglob("*.py"))
+            if path.is_file()
+        }
+    )
+    if "brainiac/load_brainiac.py" not in source_files:
+        raise RuntimeError("BrainIAC loader source is missing from provenance")
+    return {
+        "implementation": "BrainIAC",
+        "checkpoint_sha256": sha256_file(model_path),
+        "source_files_sha256": source_files,
+        "source_files_fingerprint_sha256": canonical_sha256(source_files),
+        "adapter": {
+            "input_channels": 1,
+            "resize_shape": [96, 96, 96],
+            "resize_mode": "trilinear",
+            "align_corners": False,
+            "output": "CLS token embedding",
+            "embedding_dim": int(embed_dim),
+        },
+    }
+
+
 class BrainIACWrapper(nn.Module):
     """
     Wrapper around pre-trained BrainIAC model.
@@ -49,7 +92,14 @@ class BrainIACWrapper(nn.Module):
         encode(patch: [C, pd, ph, pw]) -> [embed_dim]
     """
 
-    def __init__(self, model_path: Optional[str] = None, embed_dim: int = 768, device: str = "cuda"):
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        embed_dim: int = 768,
+        device: str = "cuda",
+        expected_checkpoint_sha256: Optional[str] = None,
+        expected_source_fingerprint_sha256: Optional[str] = None,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.device = device
@@ -66,22 +116,48 @@ class BrainIACWrapper(nn.Module):
             model_path = next((c for c in cands if Path(c).exists()), cands[-1])
         
         if not BRAINIAC_AVAILABLE:
-            # Fallback to placeholder if BrainIAC not available
-            print("⚠ BrainIAC not available. Using placeholder encoder.")
-            self.model = None
-            self.backbone = nn.Sequential(
-                nn.AdaptiveAvgPool3d(1),
-                nn.Flatten(),
-                nn.Linear(1, embed_dim),
+            raise RuntimeError(
+                "The paper-faithful image stream requires the frozen BrainIAC "
+                f"foundation model, but it could not be loaded: {BRAINIAC_ERROR}. "
+                "Set CONNECT4_BRAINIAC and CONNECT4_BRAINIAC_CKPT (or place "
+                "BrainIAC/ at the repository root)."
             )
-            return
         
+        if not Path(model_path).is_file():
+            raise FileNotFoundError(
+                f"BrainIAC checkpoint not found: {model_path}. "
+                "A pretrained checkpoint is required for paper-faithful preprocessing."
+            )
+        self.model_path = str(Path(model_path).resolve())
+        self.source_fingerprint = brainiac_source_fingerprint(
+            self.model_path, embed_dim=self.embed_dim
+        )
+        expected_checkpoint = _required_sha256(
+            expected_checkpoint_sha256
+            or os.environ.get("CONNECT4_BRAINIAC_SHA256"),
+            "BrainIAC checkpoint SHA-256",
+        )
+        expected_source = _required_sha256(
+            expected_source_fingerprint_sha256
+            or os.environ.get("CONNECT4_BRAINIAC_SOURCE_SHA256"),
+            "BrainIAC source fingerprint SHA-256",
+        )
+        if self.source_fingerprint["checkpoint_sha256"] != expected_checkpoint:
+            raise RuntimeError("BrainIAC checkpoint does not match the pinned SHA-256")
+        if (
+            self.source_fingerprint["source_files_fingerprint_sha256"]
+            != expected_source
+        ):
+            raise RuntimeError(
+                "BrainIAC loader/architecture source does not match the pinned SHA-256"
+            )
+
         print(f"Loading BrainIAC model from {model_path}...")
         
         # Load BrainIAC model
         # The model expects input size (96, 96, 96) by default
         # We'll resize patches to this size
-        self.model = load_brainiac(model_path, device=device)
+        self.model = load_brainiac(self.model_path, device=device)
         self.model.eval()
         
         # Freeze model parameters
@@ -101,19 +177,22 @@ class BrainIACWrapper(nn.Module):
         Returns:
             embedding: [embed_dim] or [B, embed_dim] - CLS token embedding(s)
         """
-        # Fallback if BrainIAC not available
-        if self.model is None:
-            if patches.dim() == 4:
-                patches = patches.unsqueeze(0)
-            feats = self.backbone(patches)
-            return feats.squeeze(0) if feats.dim() > 1 and feats.shape[0] == 1 else feats
-        
-        # Handle batch dimension
+        if not torch.is_tensor(patches):
+            raise TypeError("BrainIAC patches must be a torch.Tensor")
         batch_mode = patches.dim() == 5
-        original_batch_size = patches.shape[0] if batch_mode else 1
-        
         if patches.dim() == 4:
             patches = patches.unsqueeze(0)  # [1, C, D, H, W]
+        elif patches.dim() != 5:
+            raise ValueError(
+                "BrainIAC patches must have shape [C,D,H,W] or [B,C,D,H,W]"
+            )
+        batch_size = int(patches.shape[0])
+        if batch_size < 1 or patches.shape[1] != 1:
+            raise ValueError(
+                f"BrainIAC requires a non-empty single-channel patch batch, got {patches.shape}"
+            )
+        if not torch.isfinite(patches).all():
+            raise ValueError("BrainIAC input patches contain NaN or infinity")
         
         # Move to device
         patches = patches.to(self.device)
@@ -129,32 +208,22 @@ class BrainIACWrapper(nn.Module):
                 align_corners=False,
             )
         
-        # Ensure single channel (BrainIAC expects 1 channel)
-        if patches.shape[1] > 1:
-            patches = patches[:, 0:1, :, :, :]
-        elif patches.shape[1] == 0:
-            # Add channel dimension if missing
-            patches = patches.unsqueeze(1)
-        
         # Encode through BrainIAC
         with torch.no_grad():
             # BrainIAC forward returns CLS token embedding: [B, 768]
             cls_embedding = self.model(patches)
-            
-            # Ensure correct shape
-            if batch_mode:
-                # Batch mode: ensure [B, embed_dim]
-                if cls_embedding.dim() == 1:
-                    cls_embedding = cls_embedding.unsqueeze(0)
-                elif cls_embedding.dim() == 2 and cls_embedding.shape[0] != original_batch_size:
-                    if cls_embedding.shape[0] == 1 and original_batch_size > 1:
-                        cls_embedding = cls_embedding.expand(original_batch_size, -1)
-            else:
-                # Single patch: return [embed_dim]
-                if cls_embedding.dim() == 2:
-                    cls_embedding = cls_embedding.squeeze(0)
-        
-        return cls_embedding
+        if not torch.is_tensor(cls_embedding) or tuple(cls_embedding.shape) != (
+            batch_size,
+            self.embed_dim,
+        ):
+            shape = getattr(cls_embedding, "shape", None)
+            raise RuntimeError(
+                "BrainIAC must return exactly one configured embedding per patch: "
+                f"expected {(batch_size, self.embed_dim)}, got {shape}"
+            )
+        if not torch.isfinite(cls_embedding).all():
+            raise RuntimeError("BrainIAC produced NaN or infinity")
+        return cls_embedding if batch_mode else cls_embedding[0]
     
     def encode_batch(self, patches: Tensor) -> Tensor:
         """
@@ -168,3 +237,5 @@ class BrainIACWrapper(nn.Module):
         """
         return self.encode(patches)  # encode() handles batches efficiently
 
+
+__all__ = ["BrainIACWrapper", "brainiac_source_fingerprint"]
